@@ -1,0 +1,15 @@
+node_modules/
+.shadow-cljs/
+target/
+.cpcache/
+.nrepl-port
+*.log
+.clj-kondo/
+.lsp/
+
+# Emacs
+*~
+\#*\#
+.\#*
+*.elc
+auto-save-list/
