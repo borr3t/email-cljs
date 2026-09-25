@@ -11,6 +11,7 @@
    the client map email-cljs.smtp/smtp-client builds and are only ever
    handed back to the functions of this namespace."
   (:require ["nodemailer" :as nodemailer]
+            ["nodemailer/lib/mail-composer" :as MailComposer]
             [clojure.walk :as walk]
             [email-cljs.attachment :as att]
             [email-cljs.util :as util]
@@ -145,3 +146,30 @@
   [transport]
   (let [t (unchecked-get transport "transporter")]
     (when t (unchecked-get t "name"))))
+
+;; ---------------------------------------------------------------------------
+;; MailComposer (email-cljs.message/build — no transport)
+;; ---------------------------------------------------------------------------
+
+(defn compose
+  "Builds the RFC 822 bytes of a string-keyed camelCase message map (the
+   output of email-cljs.smtp/message->wire; Bytes still wrapped; a
+   \"keepBcc\" true entry keeps the Bcc: header in the bytes) with
+   nodemailer's MailComposer, without any transport: promise of
+   {:source <Bytes> :message-id \"<..>\" :envelope {:from :to [..]} :size n}.
+   Rejects with the raw nodemailer error (EFILEACCESS / EURLACCESS when a
+   path or href slipped past the policy, stream errors)."
+  [message]
+  (let [keep-bcc? (boolean (get message "keepBcc"))
+        composer (MailComposer. (->js (dissoc message "keepBcc")))
+        node (js-invoke composer "compile")
+        ;; keepBcc is a property of the compiled MimeNode (the stream transport
+        ;; sets it the same way), not a composer option
+        _ (when keep-bcc? (unchecked-set node "keepBcc" true))
+        env (js-invoke node "getEnvelope")]
+    (p/let [buf (js/Promise.resolve (js-invoke node "build"))]
+      {:source (att/bytes buf)
+       :message-id (js-invoke node "messageId")
+       :envelope {:from (let [v (unchecked-get env "from")] (if (string? v) v nil))
+                  :to (let [v (unchecked-get env "to")] (if (array? v) (vec v) []))}
+       :size (unchecked-get buf "length")})))

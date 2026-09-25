@@ -149,13 +149,44 @@
 ;; Client construction and lifecycle
 ;; ---------------------------------------------------------------------------
 
+(defn- capture-logger
+  "A logger object for imapflow's `logger` option that drops trace / debug
+   / info entries and hands the `err` of warn / error / fatal entries
+   (read through error->map — response status and text, never the raw
+   entry, which could carry command lines) to `f` as a map tagged
+   {:level :warn|:error}. imapflow logs a NO / BAD it swallows (SEARCH,
+   inventory 18.2) at warn level, so this is how email-cljs.imap learns
+   the server's words."
+  [f]
+  (let [noop (fn [& _] nil)
+        capture (fn [level]
+                  (fn [entry & _]
+                    (let [err (when (and (some? entry) (identical? "object" (js* "typeof ~{}" entry)))
+                                (unchecked-get entry "err"))
+                          msg (when (and (some? entry) (identical? "object" (js* "typeof ~{}" entry)))
+                                (unchecked-get entry "msg"))]
+                      (f (assoc (cond
+                                  (instance? js/Error err) (error->map err)
+                                  (string? msg) {:message msg}
+                                  (string? entry) {:message entry}
+                                  :else {:message "imapflow log entry"})
+                                :level level)))))]
+    #js {:trace noop :debug noop :info noop
+         :warn (capture :warn) :error (capture :error) :fatal (capture :error)}))
+
 (defn make-client
   "new ImapFlow(options): `options` is the string-keyed camelCase map built
    by email-cljs.imap (auth Secrets still wrapped). An 'error' listener is
    attached immediately (an unhandled 'error' would crash Node, inventory
-   12.9); it calls `on-error` (fn [error-map]) when given."
+   12.9); it calls `on-error` (fn [error-map]) when given. Unless the
+   options ask for imapflow's own console logger (\"logger\" true), a
+   capturing logger is installed that forwards warn / error entries to the
+   same `on-error` tagged with :level (see capture-logger)."
   [options on-error]
-  (let [client (ImapFlow. (->js options))]
+  (let [options (if (or (true? (get options "logger")) (nil? on-error))
+                  options
+                  (assoc options "logger" (capture-logger on-error)))
+        client (ImapFlow. (->js options))]
     (js-invoke client "on" "error" (fn [e] (when on-error (on-error (error->map e)))))
     client))
 

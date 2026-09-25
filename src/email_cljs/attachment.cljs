@@ -7,11 +7,14 @@
    Prints as #email-cljs/bytes {:size N}; equal when the bytes are equal.
 
    Only email-cljs.parse-binding touches the Buffer; this namespace is
-   interop-free. Phase 4 adds the attachment constructor/validation,
-   read-file! / write-file! and the mailparser-side helpers here."
+   interop-free. read-file! / write-file! (Phase 4) move Bytes to and from
+   the file system through the same binding; the parsed-attachment helpers
+   (attachment->base64, attachment->string, attachment-of ...) live in
+   email-cljs.message next to parse-message!."
   (:refer-clojure :exclude [bytes bytes?])
   (:require [email-cljs.parse-binding :as pb]
-            [email-cljs.util :as util]))
+            [email-cljs.util :as util]
+            [promesa.core :as p]))
 
 (defprotocol IBytes
   (unwrap [this] "The underlying Node Buffer. Binding namespaces only."))
@@ -92,3 +95,27 @@
   "Bytes [start, end) of `b` (end defaults to the size)."
   ([b start] (slice b start nil))
   ([b start end] (Bytes. (pb/buffer-slice (unwrap b) start end))))
+
+(defn read-file!
+  "Promise of the Bytes of a whole file (`~` expanded). Rejects with
+   :email-cljs/argument-error {:reason :file-unreadable :path ..} when the
+   file cannot be read."
+  [path]
+  (-> (pb/read-file-buffer path)
+      (p/then (fn [buf] (Bytes. buf)))
+      (p/catch (fn [e]
+                 (throw (util/argument-error (str "cannot read " path ": " (ex-message e))
+                                             {:reason :file-unreadable :path (str path)}))))))
+
+(defn write-file!
+  "Writes Bytes (or anything `bytes` accepts) to `path` (`~` expanded;
+   overwrites). Promise of the path written; rejects with
+   :email-cljs/argument-error {:reason :file-unwritable}."
+  [path content]
+  (-> (p/resolved nil)
+      (p/then (fn [_] (pb/write-file-buffer path (unwrap (bytes content)))))
+      (p/catch (fn [e]
+                 (if (util/error? e)
+                   (throw e)
+                   (throw (util/argument-error (str "cannot write " path ": " (ex-message e))
+                                               {:reason :file-unwritable :path (str path)})))))))

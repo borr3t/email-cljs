@@ -118,7 +118,17 @@
 
 (defn- new-state
   []
-  (atom {:connected? false :lock nil :mailbox nil :capabilities nil :last-error nil}))
+  (atom {:connected? false :lock nil :mailbox nil :capabilities nil :last-error nil :last-warning nil}))
+
+(defn- connection-handler
+  "The callback a connection factory receives: 'error' events (maps
+   without :level) and captured warn / error log entries (maps with
+   :level) — see imap-binding/make-client."
+  [state]
+  (fn [m]
+    (if (:level m)
+      (swap! state assoc :last-warning m)
+      (swap! state assoc :last-error m))))
 
 (defn imap-client
   "Builds an IMAP client map {:conn <opaque> :config <kebab, secrets
@@ -141,7 +151,7 @@
         wire (client-options->wire (dissoc opts :max-idle-ms :make-conn :secrets-file))
         state (new-state)
         make-conn (or (:make-conn opts) ib/make-client)
-        conn (make-conn wire (fn [err] (swap! state assoc :last-error err)))]
+        conn (make-conn wire (connection-handler state))]
     {:conn conn
      :config (util/redact-config (dissoc opts :make-conn))
      :options (dissoc wire "auth")
@@ -299,6 +309,15 @@
   [client]
   (:last-error @(:state client)))
 
+(defn last-warning
+  "The last warn / error entry imapflow logged for this connection
+   ({:level :warn :message :response-status :response-text :command ..}
+   — the fields of the error it wrapped) or nil. imapflow logs, instead
+   of throwing, the NO / BAD reply to a SEARCH (inventory 18.2); search!
+   reads this to explain a refused search."
+  [client]
+  (:last-warning @(:state client)))
+
 (defn connect!
   "Connects, negotiates TLS, ENABLEs extensions and authenticates. Promise
    of the client map (with :capabilities recorded) that resolves only once
@@ -405,6 +424,39 @@
   ([client mailbox items]
    (run (fn []
           (ib/status (:conn client) mailbox (into {} (map (fn [k] [(util/kebab->camel k) true])) items))))))
+
+(defn mailbox-create!
+  "CREATE `mailbox` (path string; the server's delimiter separates levels).
+   Promise of {:path :mailbox-id :created (false when it already existed
+   and the server said so)}; rejects :imap-error when refused."
+  [client mailbox]
+  (run (fn [] (ib/mailbox-create (:conn client) mailbox))))
+
+(defn mailbox-delete!
+  "DELETE `mailbox` and every message in it. Promise of {:path}; rejects
+   :imap-error (:reason :mailbox-missing when it does not exist)."
+  [client mailbox]
+  (run (fn [] (ib/mailbox-delete (:conn client) mailbox))))
+
+(defn mailbox-rename!
+  "RENAME `mailbox` to `new-path`. Promise of {:path :new-path}."
+  [client mailbox new-path]
+  (run (fn [] (ib/mailbox-rename (:conn client) mailbox new-path))))
+
+(defn server-info
+  "The server's ID response after connect! ({:name :vendor :version ..} —
+   whatever the server chose to say; nil when it has no ID extension or
+   before connect!)."
+  [client]
+  (ib/server-info (:conn client)))
+
+(defn tls-info
+  "TLS facts of the connection after connect!: {:authorized bool
+   :authorization-error .. :cipher .. :version ..} (nil when cleartext).
+   :authorized is what to check when trusting a private chain via :ca
+   (inventory 13.5)."
+  [client]
+  (ib/tls-info (:conn client)))
 
 (defn quota!
   "GETQUOTAROOT -> promise of {:path :storage {:used :limit} (BYTES —
@@ -557,23 +609,71 @@
     :else (throw (util/argument-error "range must be a UID, a vector of UIDs, a sequence-set string or a search map"
                                       {:reason :bad-range :value range}))))
 
+(defn adjust-search-for-within
+  "Pure: the WITHIN guard (inventory 18.1). On a server advertising WITHIN
+   (RFC 5032; Dovecot does) imapflow 2.0.6 sends :since / :before as
+   YOUNGER / OLDER <seconds between now and the date's UTC midnight>
+   instead of SINCE / BEFORE <day> — absolute-time semantics with exact
+   UTC-midnight boundaries, which is what the library documents anyway —
+   but a day AFTER today's UTC day yields an interval of 0 seconds, which
+   the server rejects (BAD \"Invalid search interval parameter\").
+   `compiled` is compile-search output and `today` the current UTC day
+   (\"YYYY-MM-DD\"). Returns {:empty? true} when :since lies after today
+   (nothing can have arrived after a future midnight: the search resolves
+   to no hits without a round trip), or {:query ..} with a future :before
+   dropped (always true) — {\"all\" true} when nothing else remains.
+   Top-level keys only: a future date nested under :or / :not still
+   reaches the server and comes back as :search-failed."
+  [compiled today]
+  (let [future? (fn [d] (and (string? d) (string? today) (pos? (compare d today))))]
+    (cond
+      (future? (get compiled "since")) {:empty? true}
+      (future? (get compiled "before")) (let [q (dissoc compiled "before")]
+                                          {:query (if (empty? q) {"all" true} q)})
+      :else {:query compiled})))
+
 (defn search!
   "UID SEARCH with the compile-search DSL -> promise of a vector of UIDs
    (ascending). Options: {:return [:count :min :max :all]} asks for
    ESEARCH and resolves to {:count :min :max :all \"1,5:10\"} instead
    (imapflow emulates it on servers without ESEARCH). Needs an open
-   mailbox (rejects :imap-error :reason :no-mailbox otherwise)."
+   mailbox (rejects :imap-error :reason :no-mailbox otherwise). A search
+   the server refused (NO / BAD — imapflow only logs it) rejects with
+   :imap-error :reason :search-failed carrying :response-status /
+   :response-text from last-warning and the compiled :query. On servers
+   with WITHIN, :since / :before after today's UTC day are handled
+   client-side (adjust-search-for-within)."
   ([client query] (search! client query nil))
   ([client query {:keys [return]}]
    (run (fn []
-          (let [q (compile-search query)
-                opts (cond-> {"uid" true}
-                       (seq return) (assoc "returnOptions" (mapv #(str/upper-case (name %)) return)))]
-            (p/let [r (ib/search (:conn client) q opts)]
-              (cond
-                (nil? r) (throw (util/imap-error "search needs an open mailbox" {:reason :no-mailbox :command "SEARCH"}))
-                (vector? r) r
-                :else r)))))))
+          (let [conn (:conn client)
+                state (:state client)
+                compiled (compile-search query)
+                {:keys [empty? query]} (if (ib/has-capability? conn "WITHIN")
+                                         (adjust-search-for-within compiled (subs (pb/now-iso) 0 10))
+                                         {:query compiled})
+                return-options (when (seq return) (mapv #(str/upper-case (name %)) return))
+                opts (cond-> {"uid" true} return-options (assoc "returnOptions" return-options))]
+            (if empty?
+              (if return-options
+                (cond-> {} (some #{"COUNT"} return-options) (assoc :count 0))
+                [])
+              (do
+                (swap! state assoc :last-warning nil)
+                (p/let [r (ib/search conn query opts)]
+                  (cond
+                    (nil? r) (let [open (ib/current-mailbox conn)
+                                   w (:last-warning @state)]
+                               (if open
+                                 (throw (util/imap-error (str "search refused by the server"
+                                                              (when (:response-text w) (str ": " (:response-text w))))
+                                                         {:reason :search-failed :command "SEARCH" :path (:path open)
+                                                          :query query
+                                                          :response-status (:response-status w)
+                                                          :response-text (:response-text w)}))
+                                 (throw (util/imap-error "search needs an open mailbox" {:reason :no-mailbox :command "SEARCH"}))))
+                    (vector? r) r
+                    :else r)))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Fetch
@@ -964,7 +1064,9 @@
                      :fetch? (boolean fetch?) :query query
                      :max-idle-ms (or max-idle-ms (:max-idle-ms client) default-max-idle-ms)})
          conn ((:make-conn client) (:wire-options client)
-               (fn [err] (watcher-emit! ctrl {:event :error :error (error-map->ex err)})))]
+               (fn [m] (if (:level m)
+                         (swap! ctrl assoc :last-warning m)
+                         (watcher-emit! ctrl {:event :error :error (error-map->ex m)}))))]
      (swap! ctrl assoc :conn conn
             :stop! (fn [reason] (swap! ctrl assoc :stopped? true) (watcher-finish! ctrl reason)))
      (swap! watchers assoc ch ctrl)

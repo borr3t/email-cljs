@@ -1399,3 +1399,113 @@ by a test in =test/email_cljs/{smtp,imap,attachment}_test.cljs=):
     =:expunge= =:flags= =:idle-restart= =:error= as planned.
 12. *:peek.* Accepted on fetch opts and ignored: imapflow always uses =BODY.PEEK= (13.8 still
     to be confirmed live; nothing in the library can set =\\Seen= implicitly).
+
+* 18. Phase 4+5 implementation notes and live corrections (2026-09-25)
+Found while implementing =message= / the mailparser binding (offline, covered by
+=test/email_cljs/message_test.cljs=) and while running the live smoke
+(=dev/email_cljs/smoke.cljs=, 9/9 sections green against =box.borret.ro=, Dovecot behind
+Postfix; three sends per run, all cleaned up). Items marked *LIVE* were observed on the
+server and are not predicted anywhere above.
+1. *LIVE — WITHIN changes what =:since= / =:before= send.* The server advertises =WITHIN= (RFC
+   5032; the 13.2 capability row never listed it) and imapflow 2.0.6's =searchCompiler=
+   then renders =:since= / =:before= as =YOUNGER n= / =OLDER n= — the seconds between now and
+   the date's UTC midnight (=search-compiler.js= 316-332) — instead of =SINCE= / =BEFORE=
+   =<day>=. Consequences: (a) the 13.7 "server-side day comparison" question is moot on
+   such servers: the boundary is exactly the UTC midnight the library normalises to
+   (17.1 stands, and is now timezone-proof); (b) a day after today's UTC day yields an
+   interval of 0 and Dovecot answers =BAD Error in IMAP command UID SEARCH: Invalid search
+   interval parameter=; (c) =:on= and the =:sent-*= keys are untouched (calendar days).
+   Position as built: =imap/adjust-search-for-within= (pure) runs inside =search!= when
+   the connection has WITHIN — =:since <future day>= resolves to no hits without a round
+   trip, =:before <future day>= is dropped (always true; ={:all true}= if nothing remains);
+   nested =:or= / =:not= dates are left alone and surface as 18.2's =:search-failed=. The
+   library does NOT strip =WITHIN= from the capability map (it is imapflow's data).
+2. *LIVE — imapflow swallows a refused SEARCH.* =commands/search.js= catches the =NO= / =BAD=,
+   logs it at =warn= level and returns =false=, indistinguishable from "no mailbox
+   selected" (4.6 / 8.2 list no such case). Position as built: =imap-binding/make-client=
+   installs a *capturing logger* (imapflow accepts any object with the level methods;
+   only the =err= fields go through =error->map=, never the raw entry) unless =:logger?
+   true= asked for the console logger; entries land in =imap/last-warning= (state
+   =:last-warning=, distinct from =:last-error=) and =search!= rejects with =:imap-error
+   :reason :search-failed {:response-status :response-text :query :path}= when a mailbox
+   is open, =:no-mailbox= otherwise. The watcher's connection gets its own capturing
+   logger (entries are kept on the control atom, never emitted as =:error= events).
+3. *MailComposer drops =Bcc:= by default* (11.2 / 13.20 said only the SMTP transport
+   strips it). =MimeNode= skips =Bcc= unless =keepBcc= is set — a property of the compiled
+   node (the stream transport sets =mail.message.keepBcc = true= after =compile()=), not a
+   composer option. =message/build= therefore strips =Bcc:= like a real send would and
+   offers =:keep-bcc? true= (=smtp-binding/compose= sets the property after compile); the
+   Bcc recipients are always in the built =:envelope :to=. Live: the delivered message
+   carried no =Bcc= header (13.20 confirmed for the SMTP path).
+4. *Priority: two corrections.* (a) =X-Priority= / =X-MSMail-Priority= / =Importance= are
+   written by nodemailer's *mailer* (=MailMessage.setPriorityHeaders=), not by
+   =MailComposer=, so =message/build= adds them itself (=build-wire=, ="1 (Highest)"= /
+   ="High"= / ="High"= etc., merged under the user's =:headers=). (b) mailparser never sets a
+   top-level =priority= (6.1 was wrong): the priority family is folded into ONE headers
+   entry keyed =priority= (6.3 was right) — the parsed map reads it from there
+   (=:priority :high|:normal|:low=, =:normal= when absent) and =(message/header m
+   "priority")= is ="high"= while =X-Priority= itself is absent from =:headers= (still
+   present in =:header-lines=).
+5. *Header names in the parsed map are canonical-cased strings* (="X-Custom-Header"=,
+   ="Message-ID"=, ="MIME-Version"= — =message/canonical-header-name=, acronym table
+   =header-acronyms=), not the lower-case mailparser keys 14.1 / 14.3 showed; =message/header=
+   looks them up case-insensitively. Address headers inside =:headers= are the same
+   =[{:name :address}]= vectors as the top-level fields (mailparser's ={value html text}=
+   wrapper is dropped); groups are flattened into their members tagged =:group "Team"=.
+6. *mailparser's 'now' for an unparseable Date:* (12.5) is detected: the raw =Date:= line is
+   re-parsed (=parse-binding/parse-date-iso=) and the parsed map reports =:date nil= +
+   =:date-raw "not a date"= instead of the substitute; a message without =Date:= has both
+   nil.
+7. *=skipHtmlToText= yields =text ""=*, not =undefined= (6.5); the parsed map keeps
+   mailparser's strings as they are (=text-or-html= treats blank as absent).
+8. *Streaming parse not exposed* (9.4 / 14.4 planned =parse-chan=): mailparser's stream
+   class needs a Node =Readable= as input, which no interop-free caller can produce, and
+   =imap/download!= already drains parts to =Bytes= under =:max-bytes=. =parse-message!=
+   takes a string, =Bytes= or a fetched message map carrying =:source=.
+9. *14.4 rows as built:* =email-cljs.message= = =parse-message!=, =parse-options->wire= /
+   =normalize-parsed= (pure), =canonical-header-name= / =header=, =format-parsed-address(es)=,
+   =attachment->base64= / =attachment->string= / =attachment-charset=, =attachment-of=,
+   =inline-attachments= / =file-attachments=, =text-or-html=, =build= / =build-string= /
+   =build-wire= (pure). =email-cljs.parse-binding= adds =simple-parse= + =mail->data= (Buffers
+   left opaque for =message= to wrap — =attachment= depends on =parse-binding=, so the
+   wrapping cannot happen there), =parse-date-iso=, =now-iso=, =read-file-buffer= /
+   =write-file-buffer=. =email-cljs.attachment= adds =read-file!= / =write-file!=.
+   =email-cljs.smtp-binding= adds =compose= (MailComposer). =email-cljs.imap= adds
+   =mailbox-create!= / =mailbox-delete!= / =mailbox-rename!=, =server-info=, =tls-info=,
+   =last-warning=, =adjust-search-for-within=; =smtp/message->wire= accepts
+   =:allow-no-recipients?= in the policy (drafts).
+10. *LIVE — 13.x settled by the smoke* (run 2026-09-25T01:48Z, stamp 1790300938211):
+    - 13.1 send → INBOX visible after 4.1–6.2 s (2 s polling); the watcher's =EXISTS=
+      arrived 3.1–3.3 s after =send!= resolved.
+    - 13.2 capabilities: BINARY CATENATE CHILDREN CONDSTORE CONTEXT=SEARCH ENABLE ESEARCH
+      ESORT I18NLEVEL=1 ID IDLE IMAP4rev1 LIST-EXTENDED LIST-STATUS LITERAL+
+      LOGIN-REFERRALS MOVE MULTIAPPEND NAMESPACE NOTIFY PREVIEW PREVIEW=FUZZY QRESYNC
+      QUOTA SASL-IR SAVEDATE SEARCHRES SNIPPET=FUZZY SORT SORT=DISPLAY SPECIAL-USE
+      STATUS=SIZE THREAD=ORDEREDSUBJECT THREAD=REFERENCES THREAD=REFS UIDPLUS UNSELECT
+      URL-PARTIAL WITHIN (no IMAP4rev2, no COMPRESS, no APPENDLIMIT).
+    - 13.3 wrong-password probe: skipped (fail2ban), as planned.
+    - 13.4 catch-all: =smoke-test-<stamp>@borret.ro= lands in =INBOX=.
+    - 13.5 TLS: public chain, =tls-info= ={:authorized true :version "TLSv1.3" :name
+      "TLS_AES_256_GCM_SHA384"}=; SMTP verify succeeded with default validation.
+    - 13.8 =BODY.PEEK=: flags after a =:source? true= fetch were =#{"\\Recent"}=; =\Seen= only
+      after =mark-seen!=.
+    - 13.11 UIDPLUS: =COPYUID= (=:uid-map {19 1}=), =APPENDUID= (=:uid 2=), =MOVE= =:uid-map=,
+      =UID EXPUNGE= all work.
+    - 13.12 QUOTA advertised but the account has no limits: =quota!= resolves ={:path
+      "INBOX"}= (no =:storage= / =:messages=), not =nil=.
+    - 13.17 =SUBJECT= with =ü✓= matches (UTF-8 literal).
+    - 13.18 no automatic Sent copy: =Sent= holds none of the smoke Message-IDs.
+    - 13.20 =Bcc= stripped by the SMTP transport (delivered message has no header; the
+      Bcc recipient — the account itself — received its copy: =:accepted= listed both).
+    - 13.21 =ENVELOPE= date arrived as an ISO string.
+    - 13.23 two connections (main + watcher) accepted.
+    - 13.24 EHLO: PIPELINING, SIZE 134217728 (128 MB), VRFY, ETRN, AUTH PLAIN LOGIN,
+      ENHANCEDSTATUSCODES, 8BITMIME, DSN, CHUNKING (no SMTPUTF8).
+    - Not run: 13.10 (3-minute IDLE), 13.15 (lock + manual idle), 13.16 (no drop observed
+      within the ~20 s run). Special-use map: =\Inbox INBOX=, =\Sent Sent=, =\Drafts Drafts=,
+      =\Archive Archive=, =\Junk Spam=, =\Trash Trash=. A custom keyword, once stored, is
+      listed by Dovecot in =:permanent-flags= permanently.
+11. *LIVE — process liveness.* After =stop-watch!=, =close-imap!= and =close-smtp!= the Node
+    process exits on its own (an unref'd 5 s timer never fired); at the moment of the
+    check one =TCPSocketWrap= was still tearing down (LOGOUT's socket close in flight),
+    which does not keep the loop alive.

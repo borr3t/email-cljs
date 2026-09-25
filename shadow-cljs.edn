@@ -29,6 +29,10 @@
         :output-to "target/dev.js"
         :devtools {:enabled true}}
 
-  ;; Phase 5 adds a :smoke build here (LIVE SMTP send + IMAP fetch-back against
-  ;; the catch-all account described in docs/email-api-inventory.org section 15).
-  }}
+  ;; Phase 5 LIVE smoke: real SMTP sends to the catch-all + IMAP fetch-back,
+  ;; flags, search, watch! (docs/email-api-inventory.org section 15). Needs
+  ;; BORRET_EMAIL_* (environment or ~/.secrets/borret.txt). Not part of run-tests.sh.
+  ;;   npx shadow-cljs compile smoke && node target/smoke.js
+  :smoke {:target :node-script
+          :main email-cljs.smoke/main
+          :output-to "target/smoke.js"}}}

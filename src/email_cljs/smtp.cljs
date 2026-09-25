@@ -269,7 +269,9 @@
    (:priority :high -> \"high\"). :headers / :envelope / :list are
    user-owned and pass verbatim. Attachments and alternatives: exactly one
    of :content (string or Bytes) / :bytes / :path / :href / :raw; :path and
-   :href need the client policy flags. Throws :email-cljs/argument-error:
+   :href need the client policy flags. `policy` {:allow-file-access?
+   :allow-url-access? :allow-no-recipients? (message/build drafts)}.
+   Throws :email-cljs/argument-error:
    :unknown-message-key, :no-recipients, :raw-needs-envelope,
    :bad-priority, :attachment-source, :file-access-disabled,
    :url-access-disabled, :bad-address."
@@ -281,7 +283,8 @@
          bcc (address-field (:bcc message))
          from (address-field (:from message))
          priority (:priority message)]
-     (when (and (empty? to) (empty? cc) (empty? bcc) (empty? (get-in message [:envelope :to])))
+     (when (and (empty? to) (empty? cc) (empty? bcc) (empty? (get-in message [:envelope :to]))
+                (not (:allow-no-recipients? policy)))
        (throw (util/argument-error "message has no recipients (:to / :cc / :bcc / :envelope :to)"
                                    {:reason :no-recipients})))
      (when (and (some? (:raw message)) (nil? (:envelope message)))

@@ -97,6 +97,15 @@
   (is (= {"or" [{"from" "a"} {"to" "b"}] "seen" true} (imap/compile-search {:or [{:from "a"} {:to "b"}] :seen true})))
   (is (= {"subject" "x"} (imap/compile-search {:subject "x" :from nil})) "nil values dropped"))
 
+(deftest adjust-search-for-within-guards-future-days
+  (let [today "2026-09-25"]
+    (is (= {:empty? true} (imap/adjust-search-for-within {"since" "2026-09-26" "seen" false} today)) "since tomorrow: nothing")
+    (is (= {:query {"seen" false}} (imap/adjust-search-for-within {"before" "2026-09-26" "seen" false} today)) "before tomorrow: always true, dropped")
+    (is (= {:query {"all" true}} (imap/adjust-search-for-within {"before" "2026-10-01"} today)) "nothing left -> ALL")
+    (is (= {:query {"since" "2026-09-25" "before" "2026-09-25"}} (imap/adjust-search-for-within {"since" "2026-09-25" "before" "2026-09-25"} today)) "today untouched")
+    (is (= {:query {"since" "2026-09-01"}} (imap/adjust-search-for-within {"since" "2026-09-01"} today)))
+    (is (= {:query {"or" [{"since" "2999-01-01"}]}} (imap/adjust-search-for-within {"or" [{"since" "2999-01-01"}]} today)) "nested left alone")))
+
 (deftest compile-search-rejects-bad-queries
   (let [reason (fn [q] (:reason (ex-data (tu/thrown #(imap/compile-search q)))))]
     (is (= :empty-search (reason {})))
@@ -207,6 +216,61 @@
 ;; ---------------------------------------------------------------------------
 ;; connection + mailboxes through the fake
 ;; ---------------------------------------------------------------------------
+
+(deftest search!-explains-a-refused-search-and-skips-future-within-days
+  (async done
+    (let [made (atom nil)
+          fake (tu/fake-imap {:mailbox inbox-fixture
+                              :capabilities ["IMAP4rev1" "IDLE" "UIDPLUS" "WITHIN"]
+                              :methods {"search" (fn [q _opts]
+                                                   (if (:before q)
+                                                     (do ((:on-error (first @made))
+                                                          {:level :warn :message "Command failed" :response-status "BAD"
+                                                           :response-text "Error in IMAP command UID SEARCH: Invalid search interval parameter (0.001 + 0.000 secs)."
+                                                           :command "SEARCH"})
+                                                         false)
+                                                     [5]))}})
+          [c made*] (client-with fake)
+          _ (reset! made @made*)
+          unselected (tu/fake-imap {:methods {"search" (fn [& _] false)}})
+          [cu _] (client-with unselected)]
+      (tu/finish done
+        (p/let [_ (imap/connect! c)
+                _ (imap/connect! cu)
+                no-mailbox (tu/rejection (imap/search! cu {:unseen true}))
+                _ (imap/mailbox-open! c "INBOX")
+                future-since (imap/search! c {:since "2999-01-01" :unseen true})
+                future-since-es (imap/search! c {:since "2999-01-01"} {:return [:count]})
+                future-before (imap/search! c {:before "2999-01-01" :unseen true})
+                only-before (imap/search! c {:before {:year 2999 :month 1 :day 1}})
+                refused (tu/rejection (imap/search! c {:before "2026-01-01"}))
+                searches (tu/calls-named fake "search")]
+          (is (= :no-mailbox (:reason (ex-data no-mailbox))))
+          (is (= [] future-since) "since a future UTC day: no round trip, no hits")
+          (is (= {:count 0} future-since-es))
+          (is (= [5] future-before))
+          (is (= [5] only-before))
+          (is (= [{:seen false} {:all true} {:before "2026-01-01"}] (mapv first searches))
+              "future :before dropped, lone future :before -> ALL, past :before sent (and refused by the fake)")
+          (is (= :email-cljs/imap-error (util/error-type refused)))
+          (is (= :search-failed (:reason (ex-data refused))))
+          (is (= "BAD" (:response-status (ex-data refused))))
+          (is (str/includes? (:response-text (ex-data refused)) "Invalid search interval"))
+          (is (= {"before" "2026-01-01"} (:query (ex-data refused))))
+          (is (= "INBOX" (:path (ex-data refused))))
+          (is (= :warn (:level (imap/last-warning c))))
+          (is (nil? (imap/last-error c)) "log entries never masquerade as 'error' events"))))))
+
+(deftest real-imapflow-client-captures-log-warnings-without-connecting
+  (let [c (imap/imap-client {:host "mail.example.test" :auth auth})]
+    (is (nil? (imap/last-warning c)))
+    (tu/log-warn! (:conn c) {:message "Command failed" :responseStatus "NO" :responseText "[CANNOT] nope" :command "SEARCH"})
+    (is (= {:level :warn :response-status "NO" :response-text "[CANNOT] nope" :command "SEARCH"}
+           (select-keys (imap/last-warning c) [:level :response-status :response-text :command])))
+    (is (nil? (imap/last-error c)))
+    (is (not (str/includes? (pr-str (imap/last-warning c)) tu/fake-password)))
+    (is (= "mail.example.test" (get (:options c) "host")))
+    (is (false? (get (:options c) "logger")) "the capturing logger is installed by the binding, not part of the printable options")))
 
 (deftest connect!-records-capabilities-and-maps-auth-failure
   (async done

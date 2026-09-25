@@ -116,6 +116,14 @@
       (unchecked-set e (name k) (if (coll? v) (clj->js v) v)))
     e))
 
+(defn log-warn!
+  "Makes a real imapflow client log a warn entry wrapping an Error built
+   from `err-props` (as js-error) — the way imapflow reports a swallowed
+   NO / BAD."
+  [conn err-props]
+  (js-invoke (unchecked-get conn "log") "warn" #js {:err (js-error err-props) :cid "test"})
+  nil)
+
 (defn ->clj
   "js->clj with keyword keys (for inspecting captured JS arguments)."
   [x]
