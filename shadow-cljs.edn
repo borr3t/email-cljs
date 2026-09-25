@@ -1,0 +1,34 @@
+;; shadow-cljs configuration for email-cljs.
+;; Standalone (no :deps) so `npx shadow-cljs ...` only needs Java + node_modules.
+;; promesa (pure ClojureScript, no npm package) is resolved from Clojars by the
+;; standalone shadow-cljs CLI via the :dependencies key below; deps.edn mirrors
+;; the same dependencies for consumers using :local/root / git deps.
+;; core.async ships with shadow-cljs itself (used by email-cljs.imap for the
+;; IDLE event channel, Phase 3).
+;; The `nodemailer` / `imapflow` / `mailparser` npm packages are required at
+;; runtime by the binding namespaces only (Phase 2+); shadow's :node-* targets
+;; leave npm requires external. `source-map-support` is picked up automatically
+;; by the generated node scripts when present (readable stack traces).
+{:source-paths ["src" "test" "dev"]
+ :dependencies [[funcool/promesa "12.0.1"]]
+ :builds
+ {;; Unit tests. `npx shadow-cljs compile node-test` compiles AND runs them (:autorun).
+  ;; NOTE: shadow's autorun does not propagate the test exit status, so ./run-tests.sh
+  ;; compiles with `--config-merge '{:autorun false}'` and runs `node target/node-test.js`.
+  :node-test {:target :node-test
+              :output-to "target/node-test.js"
+              :ns-regexp "-test$"
+              :autorun true}
+
+  ;; Interactive development build for a Node REPL:
+  ;;   npx shadow-cljs watch dev          ; terminal 1: compiles + hot reloads
+  ;;   node target/dev.js                 ; terminal 2: starts the Node runtime the REPL attaches to
+  ;;   npx shadow-cljs cljs-repl dev      ; terminal 3: REPL inside that Node process
+  :dev {:target :node-script
+        :main email-cljs.dev/main
+        :output-to "target/dev.js"
+        :devtools {:enabled true}}
+
+  ;; Phase 5 adds a :smoke build here (LIVE SMTP send + IMAP fetch-back against
+  ;; the catch-all account described in docs/email-api-inventory.org section 15).
+  }}

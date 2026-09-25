@@ -1,0 +1,17 @@
+{
+  "name": "email-cljs",
+  "version": "0.1.0",
+  "description": "ClojureScript (Node.js) email client library: SMTP (nodemailer), IMAP (imapflow, IDLE via core.async), message parsing (mailparser) and building, attachments; kebab-case maps in/out, promesa promises; JS interop confined to binding namespaces",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "test": "./run-tests.sh"
+  },
+  "devDependencies": {
+    "imapflow": "^2.0.6",
+    "mailparser": "^3",
+    "nodemailer": "^10.0.10",
+    "shadow-cljs": "^2.28.23",
+    "source-map-support": "^0.5.21"
+  }
+}

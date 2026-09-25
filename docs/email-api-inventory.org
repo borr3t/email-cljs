@@ -1,0 +1,1325 @@
+#+TITLE: Email API inventory — email-cljs phase 1 (nodemailer / imapflow / mailparser)
+#+DATE: 2026-09-25
+#+STARTUP: overview
+#+OPTIONS: toc:3
+
+* About this document
+This is the verified inventory of the surface that email-cljs wraps: SMTP sending through
+nodemailer, IMAP access (including IDLE) through imapflow, and message parsing through
+mailparser, plus the protocol/MIME semantics the ClojureScript API has to model. It is
+research only; implementation happens in phases 2-4 and the live smoke in phase 5.
+
+*Product constraint that shapes everything below:* the finished library is ClojureScript at
+the surface — no =^js= hints, no interop at call sites, kebab-case keyword maps in and out,
+promesa promises for every async operation, a core.async channel for the IMAP IDLE watcher —
+and its only runtime npm dependencies are the three wrapped packages. Every JS-facing detail
+inventoried here (Buffers, Maps, Sets, streams, EventEmitters, camelCase option names) is
+therefore something a *binding namespace* has to absorb (section 9), never something the
+caller sees.
+
+** Method and evidence tags
+Every fact carries one or more evidence tags:
+- =[DTS]= — from the TypeScript declarations *installed in this repo's node_modules* on
+  2026-09-25: =nodemailer@10.0.10= (=dist/esm/**/*.d.ts=, written in TypeScript since 10.0.0),
+  =imapflow@2.0.6= (=dist/esm/imap-flow.d.ts=, =types.d.ts=, =errors.d.ts=), =postal-mime@3.0.0=
+  (=postal-mime.d.ts=, tarball unpacked in the job tmp dir only, NOT installed). mailparser
+  ships no declarations; its facts come from source.
+- =[SRC]= — from the installed JavaScript source (=nodemailer/dist/cjs=, =imapflow/dist/cjs=,
+  =mailparser/lib/*.js=) where the declarations are silent (error sites, event emission sites,
+  the IDLE state machine, mailparser's whole output model).
+- =[DOC]= — from the official docs sites fetched 2026-09-25 (nodemailer.com pages, imapflow.com
+  pages; page list in section 16). Both sites are Docusaurus; neither publishes =llms.txt=.
+- =[PROBE]= — observed by running the installed packages *offline* in this session
+  (=nodemailer= stream/json transports, =mailparser= =simpleParser= on the generated message,
+  =nodemailer/lib/addressparser=, =imapflow/lib/search-compiler= with a fake connection).
+  No network connection to any mail server was made; the live smoke is phase 5.
+- =[RFC]= — protocol facts from RFC 5321 (SMTP), RFC 5322 (message format), RFC 2045-2047
+  (MIME), RFC 3501 / RFC 9051 (IMAP4rev1/rev2), RFC 2177 (IDLE), RFC 7162 (CONDSTORE/QRESYNC),
+  RFC 2087/9208 (QUOTA), RFC 6154 (SPECIAL-USE), RFC 3461 (DSN), RFC 6531 (SMTPUTF8).
+Anything not covered by these tags is in section 13 "Uncertain / needs live verification".
+
+** Reading conventions
+- Wire/option names are given verbatim (camelCase, as the packages spell them); the kebab-case
+  keyword translation lives in section 14.1. IMAP flags are given with their backslash
+  (=\Seen=); in ClojureScript strings that is ="\\Seen"=.
+- "Scope" column values: =core= (the library implements it in phases 2-4), =read=
+  (read-only helper), =later= (inventoried, deferred past phase 4), =none= (deliberately not
+  exposed, with the reason).
+- Sizes are bytes; times are milliseconds unless the package says otherwise; IMAP
+  =uidValidity= / =modseq= are JS BigInt (imapflow) — section 14.2 says what they become.
+- "The smoke account" means the catch-all account described in section 15; its credentials
+  live in =~/.secrets/borret.txt= and are never reproduced here.
+
+* 0. Coverage checklist
+| #  | Area                                                                 | Status   | Section |
+|----+----------------------------------------------------------------------+----------+---------|
+| 1  | Package census: versions, layouts, maintenance state, alternatives   | complete | 1       |
+| 2  | nodemailer surface: createTransport, SMTP options, sendMail model    | complete | 2       |
+| 3  | SMTP protocol essentials (envelope vs headers, codes, 465 vs 587)     | complete | 3       |
+| 4  | imapflow surface: ImapFlow class, options, results, events            | complete | 4       |
+| 5  | IMAP semantics (flags, UID vs seq, search DSL, fetch, bodystructure)  | complete | 5       |
+| 6  | mailparser surface: simpleParser output, MailParser stream, options   | complete | 6       |
+| 7  | MIME / message model                                                  | complete | 7       |
+| 8  | Error taxonomy (three packages -> :email-cljs/* types)                | complete | 8       |
+| 9  | Attachment handling under the no-interop rule                        | complete | 9       |
+| 10 | IDLE -> core.async design                                             | complete | 10      |
+| 11 | Message building: nodemailer model vs raw                             | complete | 11      |
+| 12 | Pitfalls                                                              | complete | 12      |
+| 13 | Uncertain / needs live verification (numbered)                        | complete | 13      |
+| 14 | Implementation notes and phase 2/3/4 outline                          | complete | 14      |
+| 15 | Phase 5 smoke plan                                                    | complete | 15      |
+| 16 | Sources                                                               | complete | 16      |
+
+* 1. Package census
+** 1.1 Versions installed and verified [DTS][SRC]
+| Package    | Installed | npm =latest= (2026-09-25) | Node floor | Language / types                                  | Runtime deps |
+|------------+-----------+---------------------------+------------+---------------------------------------------------+--------------|
+| nodemailer | 10.0.10   | 10.0.10 (published 2026-09-14) | >= 20 | TypeScript since 10.0.0 (2026-09-03); ESM + CJS builds; own =.d.ts=; =@types/nodemailer= must NOT be installed alongside (conflicting declarations) | none |
+| imapflow   | 2.0.6     | 2.0.6 (published 2026-09-22)   | >= 20 | TypeScript since 2.0.0 (2026-09-07); ESM + CJS; own =.d.ts=; =lib/= no longer published — use the package root or the =imapflow/lib/*= export map | =@zone-eu/mailsplit= 5.4.17, =encoding-japanese= 2.4.0, =iconv-lite= 0.7.3, =libbase64= 1.3.0, =libmime= 5.4.4, =libqp= 2.1.1, =pino= 10.3.1, =socks= 2.8.10 |
+| mailparser | 3.9.28    | 3.9.28 (published 2026-09-15)  | >= 20 | JavaScript, CJS only, NO type declarations (=@types/mailparser= exists on npm, not installed) | =nodemailer= 10.0.10 (its own nested copy), =@zone-eu/mailsplit= 5.4.17, =libmime= 5.4.4, =iconv-lite= 0.7.3, =encoding-japanese= 2.4.0, =html-to-text= 10.0.1, =he= 1.2.0, =linkify-it= 5.0.2, =punycode.js= 2.3.1, =tlds= 1.261.0 |
+
+Notes:
+- The task brief's expectations (nodemailer 7.x, imapflow 1.x) are stale: both had a major
+  bump this month. The first install in this job pinned =^7= / =^1= (7.0.13 / 1.7.8); the
+  scaffold was then re-pinned to =nodemailer@^10.0.10= and =imapflow@^2.0.6=, which is what
+  =package.json= now records and what this inventory describes. The 7.x/1.x line has the same
+  public API (the 10.0.0 / 2.0.0 breaking changes are the Node 20 floor and the packaging), so
+  nothing below is version-fragile, but only the installed versions were verified.
+- Node in this environment is v22.23.2 (satisfies all three floors); shadow-cljs 2.28.23.
+- nodemailer 10 keeps the =@types/nodemailer= type *layout* (=Mail.Options=,
+  =SMTPTransport.Options= …) for compatibility; the root exports the useful types
+  (=SendMailOptions=, =Transporter=, =SentMessageInfo=, =Attachment=, =Address=,
+  =NodemailerError=, =ErrorCode=) [DTS nodemailer.d.ts].
+- All three packages come from the same maintainer group (Andris Reinman / Postal Systems);
+  their docs are cross-linked and their address/MIME helpers (=libmime=, =mailsplit=,
+  =addressparser=) are shared, so the address-object shapes agree across the three (1.4).
+
+** 1.2 Maintenance state and alternatives [SRC README][DOC]
+| Slot            | Chosen     | Evidence of health                                                                 | Alternative considered | Verdict |
+|-----------------+------------+------------------------------------------------------------------------------------+------------------------+---------|
+| SMTP            | nodemailer | 11 releases in Sep 2026 alone, TS migration, security fixes (boundary/addressparser hardening) | =emailjs= (smtp-client), =smtp-client= — smaller, no MIME builder of this quality | keep nodemailer; it is the de-facto standard and ships its own message builder (=MailComposer=) which section 11 relies on |
+| IMAP            | imapflow   | 2.0.6 on 2026-09-22; active bug stream on IDLE/auto-IDLE/lock semantics; powers EmailEngine | =node-imap= (unmaintained, callback API), =imap-simple= (wrapper on node-imap) | keep imapflow; it is the only maintained promise-based IMAP client with IDLE, CONDSTORE, QRESYNC, BINARY, COMPRESS handled |
+| Parsing         | mailparser | *maintenance mode*: README states "no new features or feature changes will be added"; still gets deps bumps weekly (3.9.21-3.9.28 in Sep 2026) and security fixes | *postal-mime 3.0.0* (same maintainer, recommended by mailparser's README; zero deps; browser+Node; ships =postal-mime.d.ts=; promise API =PostalMime.parse(raw, opts) -> Email=) | *keep mailparser for phase 4, inventory postal-mime as the documented migration path*. Reasons: (a) mailparser is streaming (=MailParser= Transform stream, attachments as streams with back-pressure via =release()=), postal-mime buffers the whole message; (b) mailparser resolves =cid:= links to data URIs, produces =textAsHtml=, checksums, sizes and parsed structured headers (content-type params, priority, list-*), postal-mime returns raw header strings only; (c) the maintenance-mode notice is about *features*, security updates continue. The parsed-message map (14.3) is designed so that a postal-mime backend could replace the binding without changing the public shape — see 13.19. |
+
+postal-mime 3.0.0 shape for the record [DTS postal-mime.d.ts]: =Email {headers: Header[] (key/originalKey/value), headerLines, from?: Address, sender?, replyTo?: Address[], deliveredTo?, returnPath?, to?, cc?, bcc?: Address[], subject?, messageId?, inReplyTo?, references?: string, date?: string (ISO), html?, text?, attachments: Attachment[]}=; =Attachment {filename: string|null, mimeType, disposition: 'attachment'|'inline'|null, related?, description?, contentId?, method?, content: ArrayBuffer|Uint8Array|string, encoding?: 'base64'|'utf8'}=; options =attachmentEncoding: 'base64'|'utf8'|'arraybuffer'=, =rfc822Attachments=, =forceRfc822Attachments=, =maxNestingDepth=, =maxHeadersSize=, =maxRfc822NestingDepth=. Its =attachmentEncoding: 'base64'= option is exactly the no-interop-friendly representation section 9 chooses, which is why it is the natural future backend.
+
+** 1.3 Package layouts (what a binding namespace requires) [SRC package.json]
+| Package    | CJS entry (what shadow's =:node-*= targets =require=) | Named exports used                                   | Sub-path exports |
+|------------+------------------------------------------------------+------------------------------------------------------+------------------|
+| nodemailer | =dist/cjs/nodemailer.js= (=require("nodemailer")=)     | =createTransport=, (=createTestAccount=, =getTestMessageUrl= not used) | =nodemailer/lib/addressparser=, =nodemailer/lib/mail-composer=, =nodemailer/lib/mime-node=, =nodemailer/lib/mime-funcs=, =nodemailer/lib/base64=, =nodemailer/lib/qp=, =nodemailer/lib/smtp-connection=, =nodemailer/lib/shared= … (each maps to =dist/cjs/<name>/index.js=) |
+| imapflow   | =dist/cjs/imap-flow.js= (=require("imapflow")=)        | =ImapFlow= (class), =AuthenticationFailure= (error class) | =imapflow/lib/search-compiler=, =imapflow/lib/tools=, =imapflow/lib/special-use= … (=dist/cjs/<name>.js=) |
+| mailparser | =index.js= (=require("mailparser")=)                    | =simpleParser= (fn), =MailParser= (Transform class)   | none |
+
+shadow-cljs note: =(:require ["nodemailer" :as nodemailer])= and =["imapflow" :refer (ImapFlow)]= /
+=["mailparser" :refer (simpleParser MailParser)]= resolve through the CJS entries; the
+=:node-test= / =:node-script= targets leave npm requires external, so the packages are runtime
+requirements of the binding namespaces only (the unit tests stub them or use the offline
+transports of 2.7).
+
+** 1.4 Shared address-object shape [DTS addressparser][SRC mailparser][PROBE]
+All three packages describe a mailbox as ={name: string, address: string}= and a group as
+={name, group: [...]}=:
+- nodemailer =addressparser(str, {flatten?})= returns =Address[]= where a mailbox is
+  ={name, address}= (either may be the empty string) and a group is ={name, group: Address[]}=
+  (nested groups are flattened, RFC 5322 forbids nesting) [DTS addressparser/index.d.ts].
+- nodemailer =MimeNodeAddress= (input side) is ={name?, address?, group?}=; address input is
+  =string | MimeNodeAddress | (nested) arrays= and comma-separated strings are split
+  [DTS mime-node].
+- imapflow ENVELOPE addresses are =MessageAddressObject {name?, address?}= (no groups; the
+  server already flattened them; since 1.7.2 a NIL host no longer invents an address) [DTS types].
+- mailparser wraps a header's list into ={value: Address[], html: string, text: string}= [SRC processHeaders][PROBE].
+- postal-mime: =Mailbox {name, address}= / group ={name, group: Mailbox[]}= [DTS].
+Consequence for the library: ONE kebab shape ={:name .. :address ..}= (and ={:name .. :group [..]}=
+for groups) everywhere (14.3).
+
+* 2. nodemailer surface (SMTP)
+** 2.1 =createTransport(options[, defaults])= [DTS nodemailer.d.ts][DOC smtp]
+Returns a =Mail= instance ("transporter"). Overloads select the transport by option:
+={pool: true}= -> pooled SMTP, ={streamTransport: true}= -> stream, ={jsonTransport: true}=
+-> JSON, ={sendmail: true}= -> sendmail, ={SES: {...}}= -> SES, a =Transport= object -> plugin,
+otherwise (object or =smtp://= / =smtps://= URL string) -> single-connection SMTP.
+=defaults= is a =MailDefaults= (= =SendMailOptions=) merged into every message (headers merged
+one by one).
+
+Transporter (=Mail=) members that matter [DTS mailer/index.d.ts]:
+| Member                          | Type / behaviour                                                                         | Scope |
+|---------------------------------+------------------------------------------------------------------------------------------+-------|
+| =sendMail(data) -> Promise<T>=  | Also callback form. =T= = =SMTPSentMessageInfo= for SMTP (2.5)                            | core  |
+| =verify() -> Promise<true>=     | SMTP transports: DNS + TCP + TLS/STARTTLS + AUTH, then QUIT; rejects with the connection error; does NOT check that a sender address is accepted [DOC smtp][SRC smtp-transport verify] | core |
+| =close()=                       | Pool: closes idle connections now, busy ones after their message; queued messages rejected with "Connection pool was closed" [DOC pooled] | core |
+| =isIdle() -> boolean=           | Pool: queue has room and a connection is free/openable                                   | read  |
+| =use(step, plugin)=             | Plugin hooks ('compile', 'stream')                                                       | none (later) |
+| =set/get= meta                  | OAuth2 provisioning cb, socks module, proxy handlers                                      | none  |
+| events                          | ='idle'= (pool regained capacity), ='clear'= (last pool connection closed while idle), ='error'= (transport-level), ='token'= (OAuth2 token generated; there is NO ='tokenInvalid'= event anywhere in the source — =grep emit(= over =dist/cjs= finds only available/clear/close/connect/end/error/hash/headers/idle/token) [SRC][DOC] | read (pool events surface as a core.async channel only if phase 2 adds pooling; see 13.9) |
+
+** 2.2 SMTP transport options [DTS smtp-transport/index.d.ts + smtp-connection/index.d.ts][DOC smtp]
+=SMTPTransportOptions extends SMTPConnectionOptions, TransportOptions=:
+| Option (camelCase)          | Type / default                                            | Notes |
+|-----------------------------+-----------------------------------------------------------+-------|
+| =host=                      | string, default ="localhost"=                             | resolved via =dns.resolve4/6= first, then =dns.lookup= (so /etc/hosts only via the fallback) [DOC README] |
+| =port=                      | number, default 587, or 465 when =secure: true=            | |
+| =secure=                    | boolean, default false; *auto-true when port is 465 and secure is unset* [DOC smtp] | implicit TLS from the first byte |
+| =secured=                   | boolean                                                    | marks a caller-provided socket as already TLS |
+| =servername=                | string, default =host= unless it is an IP                  | SNI; also accepted as =tls.servername= |
+| =ignoreTLS=                 | boolean, default false                                     | never STARTTLS |
+| =requireTLS=                | boolean, default false                                     | fail if STARTTLS unavailable |
+| =opportunisticTLS=          | boolean, default false                                     | continue in cleartext if the STARTTLS upgrade fails |
+| =name=                      | string, EHLO/HELO name; default local FQDN or =[127.0.0.1]= | CRLF stripped |
+| =localAddress=              | string                                                     | |
+| =connectionTimeout=         | ms, default 120000                                         | TCP connect |
+| =greetingTimeout=           | ms, default 30000                                          | |
+| =socketTimeout=             | ms, default 600000                                         | inactivity |
+| =dnsTimeout=                | ms, default 30000                                          | DNS cache TTL 5 min, not configurable [DOC] |
+| =maxResponseSize=           | bytes, default 1 MB                                        | single server reply |
+| =lmtp=                      | boolean                                                    | LMTP instead of SMTP (adds =pending= recipients to info) |
+| =auth=                      | =SMTPTransportAuthOptions= (2.3)                           | omit for unauthenticated relay |
+| =authMethod=                | string                                                     | default SASL method when =auth.method= unset |
+| =forceAuth=                 | boolean                                                    | AUTH even if not advertised; =verify()= fails with ENOAUTH if credentials missing |
+| =customAuth=                | ={METHOD: handler}=                                        | none |
+| =service=                   | well-known name (="gmail"=…)                               | overrides host/port/secure |
+| =url=                       | =smtp(s)://user:pass@host:port/?opt=v=                     | query params become top-level options |
+| =tls=                       | Node =tls.ConnectionOptions= (=rejectUnauthorized=, =minVersion=, =ca=, =servername= …) | passthrough blob (14.1) |
+| =logger= / =debug= / =transactionLog= / =component= | logging                            | =logger: false= default (no output) |
+| =disableFileAccess= / =disableUrlAccess= | boolean                                       | refuse =path= / =href= content sources (security; see 11.4) |
+| =maxRecipients=             | number, default 100000; 0 = unlimited                      | EMAXRECIPIENTS before any send |
+| =attachDataUrls=            | boolean                                                    | data: images in html -> cid attachments |
+| =dkim=                      | =DKIMOptions=                                              | later |
+| =proxy= / =getSocket=       | proxy URL / custom socket provider                         | none |
+| =pool= + =maxConnections= (5) =maxMessages= (100) =rateLimit= (0) =rateDelta= (1000) =maxRequeues= (unlimited) | pooling [DTS smtp-pool] | see 13.9 |
+
+** 2.3 Authentication [DTS SMTPTransportAuthOptions][DOC smtp]
+={type?: 'login' (default) | 'oauth2', user, pass, method?, options?, service?}=; OAuth2 adds
+=accessToken=, =expires=, =clientId=, =clientSecret=, =refreshToken= … (XOAuth2Options).
+- Password login: nodemailer picks the first server-advertised SASL mechanism in the order
+  PLAIN, LOGIN, CRAM-MD5 (=authMethod= / =auth.method= forces one). The task brief's "auth
+  type LOGIN" is the *type* (=type: 'login'=, the default, i.e. password auth), not the SASL
+  mechanism; =AUTH LOGIN= the mechanism is selected only if PLAIN is not advertised or
+  =authMethod: 'LOGIN'= is set. [DOC smtp "Login"][SRC smtp-connection _authMethod]
+- Failures: EAUTH with =command= naming the mechanism (=AUTH PLAIN= / =AUTH LOGIN= /
+  =AUTH CRAM-MD5= / =AUTH XOAUTH2=) and =response= / =responseCode= (typically 535) (8.1).
+- Per-message =auth= override exists (=SendMailOptions.auth=) — none.
+
+** 2.4 =sendMail= message model (=SendMailOptions= = =MailComposerOptions= + mailer fields) [DTS mail-composer/index.d.ts, mailer/mail-message.d.ts][DOC message]
+| Field                | Type                                                                 | Scope | Notes |
+|----------------------+----------------------------------------------------------------------+-------+-------|
+| =from= =sender= =to= =cc= =bcc= =replyTo= | =MimeNodeAddressInput= (string / ={name,address}= / arrays, nested) | core | protected headers: override anything in =headers= |
+| =inReplyTo=          | string (Message-ID)                                                  | core  | |
+| =references=         | string or string[]                                                   | core  | |
+| =subject=            | string (Unicode ok; encoded as RFC 2047 Q/B words)                    | core  | |
+| =messageId=          | string; generated =<uuid@domain-of-from>= when missing                | core  | |
+| =date=               | Date or string; now (UTC) when missing                                | core  | |
+| =text= =html= =watchHtml= =amp= | string / Buffer / Readable / alternative object (={content|path|href|raw, contentType, encoding, contentTransferEncoding, filename, headers}=) | core (text/html); watchHtml/amp later | |
+| =icalEvent=          | string/Buffer/Readable/={method?: 'PUBLISH'...}=                      | later | text/calendar alternative + application/ics attachment |
+| =attachments=        | =MailComposerAttachment[]= (9.1)                                      | core  | |
+| =alternatives=       | =MailComposerAlternative[]= (extra multipart/alternative parts, emitted after html) | later | |
+| =headers=            | ={"X-Key": "v"}= / ={"x-key": ["v1","v2"]}= / =[{key, value}]= / ={key: {prepared: true, value, foldLines?}}= | core | keys re-cased to =X-Key= form; values RFC 2047 encoded and folded unless =prepared= |
+| =list=               | List-* helper object                                                  | later | |
+| =envelope=           | ={from?, to?, cc?, bcc?, ...extra}= (3.1)                             | core  | |
+| =priority=           | ='high' | 'normal' | 'low'=                                            | core  | high/low add =X-Priority: 1 (Highest)= / =5 (Lowest)=, =X-MSMail-Priority=, =Importance=; normal adds nothing [PROBE] |
+| =encoding=           | ='base64' | 'quoted-printable'= forced CTE for text parts               | core  | other values ignored |
+| =textEncoding=       | ='Q' (default) | 'B'= (also 'quoted-printable'/'base64')               | core  | preference when encoding IS needed |
+| =raw=                | =MimeNodeContent= (whole pre-built RFC 822 message)                    | core  | requires =envelope=; see 11.3 |
+| =dsn=                | ={ret|return, envid|id, notify, recipient|orcpt}= (RFC 3461)          | later | sent only if server advertises DSN |
+| =requireTLSExtensionEnabled= | boolean (RFC 8689)                                            | later | EREQUIRETLS if not TLS / not advertised |
+| =disableFileAccess= =disableUrlAccess= =maxRecipients= =attachDataUrls= | per-message versions of 2.2 | core (the library sets both disable* to true by default, 11.4) | |
+| =xMailer=            | string or false; no X-Mailer unless set                               | core  | |
+| =newline=            | ='windows'|'win'|'dos'|'\r\n'= -> CRLF, anything else truthy -> LF     | read  | stream transport only matters |
+| =normalizeHeaderKey= =boundaryPrefix= =baseBoundary= =keepBcc= | advanced                        | none  | |
+| =dkim= =auth= =ses=  | per-message overrides                                                 | none  | |
+
+** 2.5 =sendMail= result for SMTP (=SMTPSentMessageInfo=) [DTS smtp-transport + smtp-connection][DOC index "Response object"][SRC smtp-transport send]
+| Field            | Type            | Meaning |
+|------------------+-----------------+---------|
+| =envelope=       | ={from: string|false, to: string[]}= | what was actually used for MAIL FROM / RCPT TO (cc+bcc merged into =to=) |
+| =messageId=      | string with angle brackets | the Message-ID header value |
+| =accepted=       | string[]        | recipients the server accepted at RCPT TO (and not later rejected per-recipient at DATA for LMTP) |
+| =rejected=       | string[]        | recipients refused at RCPT TO |
+| =rejectedErrors= | =NodemailerError[]= | one per rejected recipient (=recipient=, =response=, =responseCode=, =command: 'RCPT TO'=); present only if non-empty |
+| =pending=        | string[]        | LMTP only |
+| =response=       | string          | final server reply to DATA, e.g. ="250 2.0.0 Ok: queued as ABC123"= |
+| =ehlo=           | string[]        | EHLO capability lines (e.g. =PIPELINING=, =SIZE 52428800=, =8BITMIME=, =SMTPUTF8=, =AUTH PLAIN LOGIN=, =DSN=) |
+| =envelopeTime= =messageTime= | ms  | timings |
+| =messageSize=    | bytes           | encoded size streamed |
+Partial success rule: the promise *resolves* as long as at least one recipient was accepted;
+it *rejects* with EENVELOPE "Can't send mail - all recipients were rejected" (carrying
+=rejected= / =rejectedErrors=) only when every recipient was refused [DOC index][SRC 1605-1616].
+The library therefore has to surface =:rejected= on the *success* value (14.3) — a caller who
+wants all-or-nothing must check it.
+
+** 2.6 Offline transports (for tests) [DTS json-transport, stream-transport][PROBE]
+- ={streamTransport: true, buffer: true, newline: 'unix'}= -> =info.message= is the full RFC 822
+  =Buffer= (stream when =buffer= unset); =envelope= and =messageId= as for SMTP; Bcc header is
+  KEPT in the output (so tests can see it) [DOC stream][PROBE].
+- ={jsonTransport: true, skipEncoding: true}= -> =info.message= is the normalized message
+  object (=from/to= as address objects, attachments with =content= strings, =headers= map,
+  =messageId=) [PROBE].
+The unit tests of phases 2-4 build messages through these and parse them back with mailparser
+(round-trip), which is why =run-tests.sh= needs no network.
+
+** 2.7 nodemailer helpers worth re-using inside the bindings [DTS]
+- =nodemailer/lib/addressparser= (=addressparser(str, {flatten})=) — parse header address lists
+  (used for the =:from=/=:to= string forms and for IMAP =headers= Buffers).
+- =nodemailer/lib/mail-composer= (=new MailComposer(opts).compile().build() -> Promise<Buffer>=)
+  — build an RFC 822 message WITHOUT a transport (for =append!= into IMAP, for =message/build=
+  returning bytes, for tests). Same options as =sendMail= (2.4) minus mailer-only fields
+  (=priority=, =list=, =xMailer=, =attachDataUrls=, =dsn=, =auth=, =dkim=, =maxRecipients= are
+  applied by the mailer layer, not by MailComposer) [DTS mail-composer].
+- =nodemailer/lib/mime-node= — =getEnvelope()=, =getAddresses()=, =messageId()=,
+  =createReadStream()= (streaming build).
+- =nodemailer/lib/base64=, =nodemailer/lib/qp= — encoders/decoders (section 9 does not need
+  them: Node =Buffer= base64 suffices).
+
+* 3. SMTP protocol essentials for the error taxonomy
+** 3.1 Envelope vs headers [RFC 5321/5322][DOC smtp/envelope]
+- The *envelope* is =MAIL FROM:<return-path>= + one =RCPT TO:<addr>= per recipient; it is
+  what the server delivers to and where bounces go. The *headers* (=From:=, =To:=, =Cc:=,
+  =Bcc:=) are what recipients see. nodemailer derives the envelope from =from= (falling back
+  to =replyTo= then =sender= for MAIL FROM) and =to+cc+bcc= (deduplicated), and strips the
+  =Bcc:= header from the transmitted message (SMTP transport; the stream transport keeps it).
+- =envelope: {from, to, cc, bcc, ...}= overrides it; extra keys are copied through
+  (=size=, =dsn=, =use8BitMime=, =requireTLSExtensionEnabled=) [DTS SMTPEnvelope].
+- A =raw= message *requires* an explicit envelope: nodemailer does not parse addresses out
+  of raw source [DOC custom-source].
+- Address forms accepted anywhere: ="a@b"=, ="Name <a@b>"=, ='"Doe, John" <a@b>'=,
+  ={name, address}=. Unquoted commas in display names are a hazard (12.1). IDN domains are
+  punycoded automatically when the local part is ASCII; non-ASCII local parts trigger
+  =SMTPUTF8= (only if advertised; else the server's 550/553 surfaces as EENVELOPE) [DOC addresses].
+
+** 3.2 Reply codes as nodemailer exposes them [DOC errors][SRC _formatError]
+=err.responseCode= is the leading 3-digit number of =err.response= (the raw reply line);
+=err.command= names the phase (=CONN=, =EHLO=, =AUTH PLAIN=, =MAIL FROM=, =RCPT TO=, =DATA=,
+=RSET=, =API= for client-side validation). Codes the library must classify (=util/smtp-code-class=
+does 1xx-5xx by first digit; =util/smtp-retryable?= = 4xx):
+| Code | Where              | Meaning                                         | Retryable |
+|------+--------------------+-------------------------------------------------+-----------|
+| 220  | greeting           | service ready                                   | -         |
+| 221  | QUIT               | closing                                         | -         |
+| 235  | AUTH               | authentication successful                       | -         |
+| 250  | EHLO/MAIL/RCPT/DATA end | OK (=response= of a successful send)        | -         |
+| 251/252 | RCPT            | will forward / cannot VRFY but accepts          | -         |
+| 354  | DATA               | start mail input                                | -         |
+| 421  | any                | service not available, closing (nodemailer maps to ECONNECTION) | yes |
+| 450  | RCPT               | mailbox unavailable (greylisting is usually 450/451) | yes    |
+| 451  | any                | local error / greylisted                        | yes       |
+| 452  | RCPT/DATA          | insufficient storage / too many recipients      | yes       |
+| 454  | AUTH               | temporary authentication failure                | yes       |
+| 500-504 | any             | syntax / not implemented / bad sequence         | no        |
+| 530  | MAIL               | authentication required                         | no (auth) |
+| 535  | AUTH               | credentials invalid (EAUTH)                     | no        |
+| 538  | AUTH               | encryption required for mechanism               | no        |
+| 550  | RCPT/DATA/MAIL     | mailbox unavailable / relay denied / policy     | no        |
+| 551  | RCPT               | user not local                                  | no        |
+| 552  | DATA               | exceeded storage / message too big              | no        |
+| 553  | RCPT/MAIL          | mailbox name not allowed (syntax; SMTPUTF8 refused) | no    |
+| 554  | DATA/greeting      | transaction failed / no service                 | no        |
+| 555  | MAIL/RCPT          | parameters not recognized                       | no        |
+Enhanced status codes (=5.7.8=, =2.0.0=) ride in =response= text; nodemailer does not parse
+them (only custom-auth handlers see =code=). The library keeps =:response= verbatim.
+
+** 3.3 465 implicit TLS vs 587 STARTTLS [DOC smtp][DTS][RFC 8314]
+| Port | Mode                       | nodemailer                                              | imapflow analogue |
+|------+----------------------------+---------------------------------------------------------+-------------------|
+| 465  | implicit TLS ("SMTPS")     | =secure: true= (auto when port 465 and =secure= unset); TLS handshake before the greeting; STARTTLS never used | port 993 =secure: true= (auto when port 993 and =secure= unset) |
+| 587  | submission + STARTTLS      | =secure: false= (default); cleartext EHLO, then STARTTLS if advertised (unless =ignoreTLS=); =requireTLS: true= to refuse cleartext fallback | port 143 =secure: false=; =doSTARTTLS: true= to require the upgrade, =false= to forbid it |
+| 25   | MTA relay                  | as 587; usually blocked outbound by ISPs                | -                 |
+The smoke account is =465= with TLS (and IMAP =993= with TLS): the library's config maps
+=:smtp {:host :port 465 :tls? true}= to =secure: true= and =:imap {:port 993 :tls? true}= to
+=secure: true=. TLS errors: nodemailer =ETLS= (handshake, STARTTLS, certificate) [DTS errors];
+imapflow stamps =tlsFailed: true= on the error and uses code =UPGRADE_TIMEOUT= /
+=STARTTLS_INJECTION= for the STARTTLS paths [SRC]. Certificate validation is on by default
+in both (=tls.rejectUnauthorized: true=); the library exposes =:tls {:reject-unauthorized ..
+:ca .. :min-version .. :servername ..}= as a verbatim passthrough (14.1) and never defaults it
+off. Pinning: pass =:ca= (PEM) or =:check-server-identity= (a fn) in that blob — both are Node
+=tls.connect= options (13.5 for the smoke host).
+
+* 4. imapflow surface (IMAP)
+** 4.1 Constructor options (=ImapFlowOptions=) [DTS types.d.ts][DOC configuration]
+| Option                 | Type / default                          | Notes / scope |
+|------------------------+-----------------------------------------+---------------|
+| =host=                 | string (default localhost)              | core |
+| =port=                 | number; 993 if =secure=, else 143; *port 993 without =secure= implies =secure: true* | core |
+| =secure=               | boolean                                 | implicit TLS; core |
+| =doSTARTTLS=           | boolean or unset                        | true = require upgrade, false = never; invalid with =secure: true= |
+| =servername=           | string (SNI)                            | core (tls blob) |
+| =auth=                 | ={user, pass?, accessToken?, loginMethod?: 'LOGIN'|'AUTH=LOGIN'|'AUTH=PLAIN', authzid?}= | core (password) |
+| =tls=                  | Node =tls.ConnectionOptions=            | passthrough |
+| =logger=               | pino-like object or =false=             | *default is a pino instance writing to stdout* — the library sets =logger: false= unless the caller passes =:logger= (12.10) |
+| =emitLogs= / =logRaw=  | boolean                                 | ='log'= events; raw base64 frames with credentials masked |
+| =clientInfo=           | ID extension ={name, version, vendor, 'support-url', date}= | core: ={name: "email-cljs"}= |
+| =disableAutoIdle=      | boolean, default false                  | see 10.1 — the library sets =true= |
+| =autoIdleDelay=        | ms, default 15000 (capped below =socketTimeout=) | only with auto-IDLE |
+| =maxIdleTime=          | ms; break+restart IDLE every N ms       | core (default 29 min < RFC 2177's 30-min server timeout; 13.10) |
+| =missingIdleCommand=   | ='NOOP' (default) | 'SELECT' | 'STATUS'= | poll fallback when no IDLE capability; interval = min(2 min, maxIdleTime) |
+| =qresync=              | boolean                                 | EXPUNGE events carry =uid= instead of =seq= (VANISHED) — the library enables it (10.3) |
+| =disableCompression= =disableBinary= =disableAutoEnable= =disableIMAP4rev2= | boolean | pass-through options |
+| =connectionTimeout=    | ms, default 90000 (DNS + proxy + TCP + TLS as one budget; error code =CONNECT_TIMEOUT=) | core |
+| =greetingTimeout=      | ms, default 16000 (=GREETING_TIMEOUT=)  | core |
+| =socketTimeout=        | ms, default 300000 inactivity (=ETIMEOUT=) | core |
+| =maxLineLength= =maxLiteralSize= =maxResponseSize= | bytes; defaults 1 GB / 1 GB / 2 GB; terminal errors =LineTooLarge= / =LiteralTooLarge= / =ResponseTooLarge= | core (the library lowers the literal cap, 12.6) |
+| =maxLockHoldTime=      | ms, default 30 min; warning only        | read |
+| =proxy=                | socks/http URL                          | none |
+| =verifyOnly= (+ =includeMailboxes=) | connect, authenticate, (list), logout | core: =verify!= |
+| =expungeHandler=       | =(event) => Promise|void=; when set the ='expunge'= event is NOT emitted | none (10.2 uses the event) |
+| =id=                   | string for logs                         | read |
+
+** 4.2 Instance properties [DTS imap-flow.d.ts]
+=capabilities: Map<string, boolean|number>= (e.g. =IDLE=, =CONDSTORE=, =QRESYNC=, =UIDPLUS=,
+=MOVE=, =QUOTA=, =SPECIAL-USE=, =LIST-STATUS=, =APPENDLIMIT -> number=), =enabled: Set<string>=
+(=CONDSTORE=, =UTF8=ACCEPT=, =QRESYNC=, =IMAP4REV2= after ENABLE), =usable=, =authenticated:
+string|boolean=, =mailbox: MailboxObject|false=, =idling=, =state= (1 NOT_AUTHENTICATED, 2
+AUTHENTICATED, 3 SELECTED, 4 LOGOUT), =secureConnection=, =tls: TlsInfo|false= (cipher +
+=authorized=), =serverInfo= (ID), =namespace= / =namespaces=, =greeting=, =byeReason=,
+=isClosed=. The library exposes =capabilities= as a kebab map (=:idle true :appendlimit 26214400=)
+and =enabled= as a set of keywords (14.3).
+
+** 4.3 Methods [DTS imap-flow.d.ts][DOC api]
+| Method                                             | Returns                                  | Scope | Notes |
+|----------------------------------------------------+------------------------------------------+-------+-------|
+| =connect()=                                        | =Promise<void>=                          | core  | connects, TLS/STARTTLS, greeting, ID, ENABLE, AUTH; throws (=AuthenticationFailure= on bad credentials) |
+| =logout()=                                         | =Promise<void>=                          | core  | LOGOUT then close |
+| =close()= / =closeAfter()=                         | void                                     | core  | no LOGOUT; =closeAfter= defers via setImmediate |
+| =upgradeToSTARTTLS()=                              | =Promise<boolean>=                       | none  | automatic |
+| =noop()=                                           | =Promise<void>=                          | read  | |
+| =stats(reset?)=                                    | ={sent, received}= bytes                 | read  | |
+| =list(options?)=                                   | =Promise<ListResponse[]>= (5.1)          | core  | =statusQuery= adds STATUS per mailbox (LIST-STATUS or N STATUS calls); =specialUseHints=; =listOnly= |
+| =listTree(options?)=                               | tree of =ListTreeResponse=               | read  | |
+| =status(path, query)=                              | =StatusObject= (5.1)                     | core  | without selecting |
+| =getQuota(path?)=                                  | =QuotaResponse | false=                  | core  | false if no QUOTA capability or unknown path |
+| =mailboxCreate/Rename/Delete/Subscribe/Unsubscribe= | response objects / boolean              | core  | path may be a string[] joined with the delimiter (+ namespace prefix) |
+| =mailboxOpen(path, {readOnly?, description?})=     | =MailboxObject= (5.1)                    | core (internal) | SELECT / EXAMINE |
+| =mailboxClose()=                                   | boolean                                  | core  | CLOSE (which EXPUNGES on non-readonly! RFC 3501 §6.4.2 — 12.7) |
+| =getMailboxLock(path, {readOnly?, acquireTimeout?, maxLockHoldTime?})= | ={path, release()}= | core | serialises mailbox use; =LockTimeout= code; *auto-IDLE never arms while a lock is held* (10.1) |
+| =idle()=                                           | =Promise<boolean|undefined>=             | core  | resolves when IDLE ends (broken by another command, =maxIdleTime= restart handled internally, or connection close); =undefined= if not SELECTED; false on failure |
+| =search(query, {uid?, returnOptions?})=            | =number[]= (seq or UID) / =ESearchResult= / =false= | core | (5.3) |
+| =fetch(range, query, {uid?, changedSince?, binary?})= | =AsyncGenerator<FetchMessageObject>=  | core (binding drains it) | *no other command may run inside the iteration — deadlock* [DOC] |
+| =fetchAll(range, query, options?)=                 | =Promise<FetchMessageObject[]>=          | core  | the library's default (bounded ranges) |
+| =fetchOne(seq, query, options?)=                   | =FetchMessageObject | false | undefined= | core  | |
+| =download(range, part?, {uid?, maxBytes?, chunkSize?})= | ={meta: DownloadMeta, content: Readable}= | core (9.3) | decoded part (CTE removed, text -> UTF-8); whole RFC 822 when =part= omitted; empty object when not found |
+| =downloadMany(range, parts[], options?)=           | ={[part]: {meta, content: Buffer|null}}= | core (9.3) | |
+| =messageFlagsSet/Add/Remove(range, flags[], {uid?, unchangedSince?, useLabels?, silent?})= | boolean | core | flags not permitted by =permanentFlags= are silently dropped (except on remove) [SRC store.js] |
+| =setFlagColor(range, color, options?)=             | boolean                                  | later | Apple Mail =$MailFlagBit0/1/2= encoding (5.2) |
+| =messageDelete(range, {uid?})=                     | boolean                                  | core  | =\Deleted= + UID EXPUNGE (UIDPLUS) or EXPUNGE; no info about what was deleted — listen to ='expunge'= |
+| =messageCopy/messageMove(range, destination, {uid?})= | ={path, destination, uidValidity?, uidMap?: Map<src,dst>} | false= | core | MOVE if capable else COPY+delete; =uidMap= needs UIDPLUS (COPYUID) |
+| =append(path, content, flags?, idate?)=            | ={destination, uid?, uidValidity?, seq?} | false= | core | =uid= needs UIDPLUS (APPENDUID) |
+| =unbind()=                                         | sockets                                  | none  | |
+
+** 4.4 Events (=ImapFlowEvents=) [DTS types.d.ts][SRC emit sites]
+| Event          | Payload                                                                         | When |
+|----------------+---------------------------------------------------------------------------------+------|
+| ='exists'=     | ={path, count, prevCount}=                                                      | untagged =* N EXISTS= whose N differs from =mailbox.exists= — during IDLE *or any command*; this is the "new mail" signal (10.2) |
+| ='expunge'=    | ={path, seq?, uid?, vanished: boolean, earlier?}=                               | one per expunged message: =seq= for plain EXPUNGE, =uid= for VANISHED (QRESYNC); suppressed when =expungeHandler= is set |
+| ='flags'=      | ={path, seq, uid?, modseq?, flags: Set, flagColor?}=                            | untagged FETCH carrying FLAGS (server-side changes from another client, or own STORE unless =silent=); "not all servers fire this" |
+| ='mailboxOpen'= | =MailboxObject=                                                                | after SELECT/EXAMINE |
+| ='mailboxClose'= | =MailboxObject=                                                               | explicit close, switching mailbox, or connection loss while selected (before ='close'=) |
+| ='close'=      | none                                                                            | TCP closed; *no auto-reconnect ever* |
+| ='error'=      | =Error= (=ImapFlowError=)                                                       | usually means the connection is gone; unhandled 'error' on an EventEmitter would crash Node -> the binding must always attach a listener (12.9) |
+| ='response'=   | ={response, code?}=                                                             | every tagged response |
+| ='log'=        | =LogEvent {level, t, cid, lo, ...}=                                             | only with =emitLogs= |
+
+** 4.5 IDLE state machine as implemented [SRC commands/idle.js, imap-flow.js autoidle/connectionBusy]
+- =idle()= -> =run('IDLE', maxIdleTime)=: if the server has =IDLE=, loops =runIdle= sessions;
+  each session sends =IDLE=, waits for the =+= continuation, then sits until =preCheck()= is
+  called (by ANY other command entering =run()=, by =close()=, or by the =maxIdleTime= timer)
+  which writes =DONE=; the tagged OK ends the session. Without =IDLE= it falls back to a
+  polling loop (=NOOP= / =STATUS= / =SELECT= every =min(2 min, maxIdleTime)=).
+- Auto-IDLE (=disableAutoIdle: false=): =autoidle()= arms a timer (=autoIdleDelay=) after every
+  command *unless the connection is busy*: =connectionBusy()= = a mailbox lock is held or
+  queued, a command is in flight or queued, or a download stream is open. So *while
+  =getMailboxLock= is held there is NO auto-IDLE and NO push notifications* — the release
+  restarts it. Untagged responses still arrive during normal commands, so ='exists'= can also
+  fire mid-FETCH.
+- Timers (auto-IDLE, IDLE restart, poll) are =unref='d: an idle process is not kept alive by
+  them; the library's watcher (10.2) therefore has to hold its own reference if the caller's
+  process has nothing else to do (a pending promise / channel take does that).
+- The promise returned by =idle()= is the natural "one IDLE session" unit; events flow through
+  the emitter concurrently with it.
+
+** 4.6 Errors (=ImapFlowError=, =AuthenticationFailure=) [DTS errors.d.ts][SRC]
+Plain =Error= objects with optional props: =code=, =command=, =path=, =responseStatus:
+'NO'|'BAD'=, =responseText=, =response= (parsed or text), =serverResponseCode= (bracketed
+response code such as =AUTHENTICATIONFAILED=, =TRYCREATE=, =NONEXISTENT=, =ALREADYEXISTS=,
+=OVERQUOTA=, =EXPUNGEISSUED=, =LIMIT=), =executedCommand=, =authenticationFailed=, =tlsFailed=,
+=throttleReset= (ms; with =ETHROTTLE=), =mailboxMissing= (SELECT of a nonexistent path),
+=lockId=, =reason= (BYE), parser diagnostics (=parserError=, =literalSize=, =lineLength=,
+=responseSize=, =maxSize=), =oauthError=.
+=code= values found in the source: =NoConnection= (docs), =CONNECT_TIMEOUT=, =GREETING_TIMEOUT=,
+=UPGRADE_TIMEOUT=, =ETIMEOUT= (socket inactivity), =EConnectionClosed= (docs), =LockTimeout=,
+=MissingServerExtension= (e.g. =new/old/recent= search on IMAP4rev2; =modseq= without CONDSTORE),
+=ETHROTTLE=, =LineTooLarge=, =LiteralTooLarge=, =ResponseTooLarge=, =DownloadOverflow= (=maxBytes=
+exceeded), =PollFailed=, =NotFound=, =InvalidSequenceSet=, =InvalidStringValue= /
+=InvalidTextValue= / =InvalidTokenValue= / =InvalidResponse= / =UnexpectedTag= /
+=ParserErrorExchange= / =ResponseProcessingFailed= (parser), =STARTTLS_INJECTION=,
+=COMPRESS_TRAILING_DATA=, =MAX_IMAP_NESTING_REACHED=.
+=AuthenticationFailure= (exported class): =authenticationFailed: true=, =serverResponseCode?=,
+=response?: string= (server text), =oauthError?=. Mapping in section 8.
+
+* 5. IMAP semantics the library models
+** 5.1 Mailboxes [DTS ListResponse / MailboxObject / StatusObject][RFC 3501 §7.2.2, RFC 6154]
+- =ListResponse=: =path= (unicode), =pathAsListed= (wire, modified-UTF-7 decoded by imapflow),
+  =name=, =delimiter= (="."= or ="/"=), =parent: string[]=, =parentPath=, =flags: Set<string>=,
+  =specialUse?=, =specialUseSource?: 'user'|'extension'|'name'=, =listed=, =subscribed=,
+  =status?= (if =statusQuery=).
+- Mailbox attributes (LIST flags): =\HasChildren= / =\HasNoChildren= (RFC 5258), =\Noselect=
+  (cannot be SELECTed — skip), =\Noinferiors=, =\Marked= / =\Unmarked=, =\NonExistent=,
+  =\Subscribed=, =\Remote=; special-use (RFC 6154 or XLIST): =\All=, =\Archive=, =\Drafts=,
+  =\Flagged=, =\Junk=, =\Sent=, =\Trash= (+ imapflow's non-standard =\Inbox= for INBOX and
+  =\Important=). imapflow ALSO guesses special-use from localized folder names when the server
+  does not advertise SPECIAL-USE (=specialUseSource: 'name'=) [DTS special-use.d.ts].
+- =MailboxObject= (after SELECT): =path=, =delimiter=, =flags: Set= (FLAGS), =permanentFlags?:
+  Set= (=\*= means any keyword may be created), =uidValidity: bigint=, =uidNext=, =exists=,
+  =unseen?= (the FIRST unseen seq number, not a count), =highestModseq?: bigint=, =noModseq?=,
+  =mailboxId?= (OBJECTID), =appendlimit?=, =readOnly?=, =specialUse?=.
+- =StatusObject= / =StatusQuery=: =messages=, =recent= (always 0 on IMAP4rev2), =uidNext=,
+  =uidValidity: bigint=, =unseen= (a COUNT here), =highestModseq: bigint=, =size= (STATUS=SIZE or
+  rev2), =deleted= (rev2). Items the server cannot report are omitted.
+- Paths: =string | string[]=; arrays are joined with the delimiter and the personal namespace
+  prefix is added (e.g. =INBOX.= on Dovecot/Courier layouts). Unicode allowed (UTF8=ACCEPT or
+  modified UTF-7 handled by imapflow).
+- =UIDVALIDITY=: if it changes, every cached UID is invalid (RFC 3501 §2.3.1.1).
+
+** 5.2 Message flags [RFC 3501 §2.3.2][DTS][SRC tools.js]
+System flags: =\Seen=, =\Answered=, =\Flagged=, =\Deleted=, =\Draft=, =\Recent= (read-only,
+gone in IMAP4rev2). Keywords (custom flags, no backslash): any atom if =permanentFlags= has
+=\*=; common IANA-registered ones =$Forwarded=, =$MDNSent=, =$Junk=, =$NotJunk=, =$Phishing=,
+=$Important=; Apple colors =$MailFlagBit0/1/2= (3-bit index into red, orange, yellow, green,
+blue, purple, grey — imapflow derives =flagColor= and =setFlagColor= writes them). imapflow
+represents flags as =Set<string>= with the backslash; STORE drops flags not allowed by
+=permanentFlags= (add/set) silently [SRC store.js canUseFlag]. The library models flags as a
+set of strings exactly as on the wire (="\\Seen"=) plus convenience predicates (14.3); it
+does not invent keyword-to-keyword translations (=:seen= <-> ="\\Seen"=) beyond the *search*
+DSL where imapflow itself uses booleans.
+
+** 5.3 Sequence sets vs UIDs [RFC 3501 §2.3.1][DTS MessageRange / SequenceString][DOC basic-usage]
+- Sequence numbers are positional (1..N) and shift on EXPUNGE; UIDs are stable within a
+  UIDVALIDITY. Every imapflow range method takes ={uid: true}= to interpret the range as UIDs;
+  results always carry both =seq= and =uid=.
+- =MessageRange= = =SequenceString= (string / number / bigint: ="1:10"=, ="1,3,5"=, ="100:*"=,
+  ="*"=; imapflow extension ="*:-10"= = last 10) | =number[]= | =SearchObject= (resolved by a
+  SEARCH first).
+- House position: the library is *UID-first*: every public fn takes and returns UIDs and
+  passes ={uid: true}=; sequence numbers are exposed read-only as =:seq= on fetched messages
+  and on expunge events when the server did not give a UID (14.3).
+
+** 5.4 Search DSL (=SearchObject=) [DTS types.d.ts][SRC search-compiler.js][PROBE]
+Keys and the IMAP keys they compile to (all ANDed at one level):
+| Key (imapflow)                       | IMAP                                   | Notes |
+|--------------------------------------+----------------------------------------+-------|
+| =seq= / =uid= (SequenceString)       | bare sequence-set / =UID <set>=        | |
+| =answered deleted draft flagged seen= (boolean) | =ANSWERED=/=UNANSWERED= …, =SEEN=/=UNSEEN= | false -> the UN* form |
+| =all= =new= =old= =recent= (true)    | =ALL= =NEW= =OLD= =RECENT=             | new/old/recent -> =MissingServerExtension= on IMAP4rev2 sessions |
+| =from to cc bcc subject body text= (string) | =FROM "x"= … =TEXT "x"=           | substring, case-insensitive per server; non-ASCII needs CHARSET (imapflow handles UTF-8 / UTF8=ACCEPT) |
+| =larger= / =smaller= (number)        | =LARGER n= / =SMALLER n=               | bytes |
+| =before= / =on= / =since= (Date or string) | =BEFORE d= / =ON d= / =SINCE d=  | INTERNALDATE, day granularity, rendered =01-Sep-2026=; an *invalid date is silently dropped* (compiles to nothing; 1.7.4) [PROBE] |
+| =sentBefore= / =sentOn= / =sentSince= | =SENTBEFORE= … (Date: header)          | day granularity |
+| =keyword= / =unKeyword= (string)     | =KEYWORD $X= / =UNKEYWORD $X=          | |
+| =header= ={"Name": string|true}=     | =HEADER Name "value"= (=true= -> empty string = header present) | names upper-cased on the wire [PROBE] |
+| =modseq= (bigint/number)             | =MODSEQ n=                             | needs CONDSTORE |
+| =emailId= / =threadId=               | =EMAILID= / =THREADID= (OBJECTID) or X-GM-MSGID/THRID | |
+| =not= (SearchObject)                 | =NOT (…)=                              | |
+| =or= (SearchObject[], >= 2)          | =OR a b= (nested pairwise)             | |
+| =gmraw= / =gmailraw= / =labels {has, not}= | =X-GM-RAW=                        | Gmail only |
+Empty query -> =[]= attributes -> imapflow sends =ALL= (the compiler returns [] and the SEARCH
+command supplies the default) — 13.6. Options: ={uid: true}= (return UIDs), =returnOptions:
+['MIN'|'MAX'|'COUNT'|'ALL'|{partial: '1:100'}]= -> =ESearchResult {count?, min?, max?, all?:
+"1,5:10", partial?: {range, messages}, modseq?}= (imapflow emulates when the server lacks
+ESEARCH).
+Date/timezone: IMAP dates carry no time; the server compares against its own notion of the
+message's date in *its* timezone; imapflow renders the JS Date via its local components —
+so a query =since 2026-09-25= built at 00:30 local on a UTC+3 machine may be a day off from
+the server's view (12.4 / 13.7).
+
+** 5.5 Fetch query (=FetchQueryObject=) and result (=FetchMessageObject=) [DTS types.d.ts][DOC fetching]
+| Query key         | Result field                    | Result type                            |
+|-------------------+---------------------------------+----------------------------------------|
+| (always)          | =seq=, =uid=                    | number, number                         |
+| =uid=             | =uid=                           | (always included anyway)               |
+| =flags=           | =flags=, =flagColor=            | =Set<string>=, string                  |
+| =envelope=        | =envelope=                      | ={date: Date|string, subject, messageId, inReplyTo, from[], sender[], replyTo[], to[], cc[], bcc[]}= (addresses ={name?, address?}=); =date= is a =Date= when parseable else the raw string [SRC tools.js 903-908] |
+| =bodyStructure=   | =bodyStructure=                 | =MessageStructureObject= tree (5.6)    |
+| =internalDate=    | =internalDate=                  | =Date= (string if unparseable)         |
+| =size=            | =size=                          | RFC822.SIZE bytes                      |
+| =source= (true or ={start, maxLength}=) | =source=          | =Buffer= (whole RFC 822 or byte range) |
+| =headers= (true or =string[]=)  | =headers=         | =Buffer= of raw header lines (all, or =BODY.PEEK[HEADER.FIELDS (...)]=) |
+| =bodyParts= (=["1", "2.1", "TEXT", "HEADER", {key, start, maxLength}]=) | =bodyParts=, =binaryParts= | =Map<string, Buffer>= (raw, still transfer-encoded unless in =binaryParts=) |
+| =threadId= =labels= =emailId= | same                | OBJECTID / Gmail                       |
+| =fast= / =all= / =full= | macros                    | flags+internalDate+size (+envelope) (+bodyStructure) |
+| (CONDSTORE)       | =modseq=                        | bigint, always when enabled            |
+Options: ={uid, changedSince: bigint, binary}=. imapflow always uses =BODY.PEEK= so fetching
+never sets =\Seen= implicitly (13.8 to confirm on the smoke host).
+
+** 5.6 Body structure tree (=MessageStructureObject=) [DTS][RFC 3501 §7.4.2]
+={part?: "1.2", type: "text/plain" (full type/subtype, lower-case), parameters?: {charset, name,
+boundary…}, id?: "<cid>", encoding?: "base64"|"quoted-printable"|"7bit"|"8bit"|"binary",
+size?, envelope? (message/rfc822 parts), disposition?: "attachment"|"inline",
+dispositionParameters?: {filename…}, childNodes?: [...], md5?, language?: string[], location?,
+description?, lineCount?}=. Multipart nodes have =type: "multipart/mixed"= etc. and
+=childNodes=; part numbers: children of the root multipart are =1=, =2=…; nested =1.1=, =1.2=;
+a non-multipart root is part =1= (=part= undefined on the root). This matches the =partId=
+mailparser assigns (=1.2.2= for the inline image of the probe message in 7.2) [PROBE].
+Attachment detection heuristic (imapflow docs): =disposition === 'attachment'= or a non-text,
+non-multipart type without disposition; inline images live under =multipart/related= with an
+=id= (cid). Section 9.3 uses this tree to download single parts without fetching =source=.
+
+** 5.7 Expunge semantics [RFC 3501 §6.4.3, RFC 4315, RFC 7162][DTS]
+- Deleting = STORE =\Deleted= + =EXPUNGE= (all =\Deleted= in the mailbox!) or =UID EXPUNGE
+  <set>= (UIDPLUS; only those). imapflow's =messageDelete= uses UID EXPUNGE when capable
+  (safe) — the library's =delete!= therefore never expunges *other* clients' =\Deleted= marks
+  unless UIDPLUS is missing (13.11). =mailboxClose()= sends CLOSE which expunges everything
+  =\Deleted= in a read-write mailbox (12.7); =UNSELECT= is what a non-expunging close needs and
+  imapflow does not expose it — the library opens read-only when the caller only reads.
+- Notifications: one ='expunge'= event per message, =seq= (shifting!) unless QRESYNC gives
+  =uid= (VANISHED, =vanished: true=; =earlier: true= for VANISHED (EARLIER) replays on SELECT).
+  Applying seq-based expunges to a cached list requires processing them in order and
+  decrementing later seqs — the reason the library enables =qresync= (10.3) and reports UIDs.
+- =\Recent=: unreliable / gone in rev2; never relied on.
+
+** 5.8 QUOTA, CONDSTORE / MODSEQ, other extensions [DTS][RFC 2087/9208, 7162]
+- QUOTA: =getQuota(path) -> {path, storage?: {used, limit} (bytes; the wire unit is KiB — imapflow
+  converts, 13.12), messages?: {used, limit}, ...other resources} | false=.
+- CONDSTORE: auto-enabled when advertised (=enabled= has =CONDSTORE=); then =mailbox.highestModseq=,
+  =message.modseq= (bigint) on every fetch, =fetch(..., {changedSince})=, =search({modseq})=,
+  store =unchangedSince=, =status({highestModseq})=, ='flags'= events carry =modseq=. QRESYNC
+  (opt-in =qresync: true=) additionally: VANISHED expunges with UIDs. Yes, imapflow surfaces
+  MODSEQ fully; the library exposes it as =:modseq= (a string, 14.2) and =changed-since=.
+- BINARY (RFC 3516): =fetch(..., {binary: true})= makes the server decode the CTE (=binaryParts=
+  says which parts arrived decoded); =download()= decodes client-side anyway.
+- COMPRESS=DEFLATE, ID, ENABLE, UTF8=ACCEPT, MOVE, UIDPLUS, LIST-STATUS, LIST-EXTENDED,
+  SPECIAL-USE, OBJECTID, STATUS=SIZE, APPENDLIMIT, NAMESPACE, IMAP4rev2: all detected and used
+  automatically; the library surfaces =capabilities= and otherwise stays extension-agnostic.
+- Not exposed by imapflow (so not by the library): NOTIFY (RFC 5465), SORT/THREAD (RFC 5256),
+  MULTIAPPEND, UNSELECT, ACL, METADATA. Server-side sort/thread is therefore =none= (13.13).
+
+* 6. mailparser surface
+** 6.1 =simpleParser(source, options?) -> Promise<Mail>= [SRC simple-parser.js][DOC extras/mailparser][PROBE]
+=source=: string, Buffer or readable stream (a nodemailer stream-transport =message=, an
+imapflow =source= Buffer or =download()= stream). Whole message and every attachment are
+buffered in memory.
+Resolved =mail= object (top-level keys, camelCase):
+| Key            | Type                                                         | Source rule |
+|----------------+--------------------------------------------------------------+-------------|
+| =headers=      | =Map<string, value>= keyed by lower-case header name          | 6.3 |
+| =headerLines=  | =[{key, line}]= raw folded-joined lines in order              | |
+| =subject=      | string (RFC 2047 decoded)                                     | copied from headers |
+| =from= =sender= =replyTo= =to= =cc= =bcc= | ={value: [{name, address}|{name, group}], html, text}= | copied; absent when the header is absent |
+| =date=         | =Date= (unparseable -> *now* — 12.5)                          | |
+| =messageId= =inReplyTo= | string WITH angle brackets (normalised: brackets added if missing) | |
+| =references=   | string or string[] of bracketed ids                           | |
+| =priority=     | ='high'|'normal'|'low'= — *only present when a priority header exists* (=X-Priority=, =X-MSMail-Priority=, =Importance=, =Priority=; numeric 1-2 high, 3 normal, >3 low) [PROBE: undefined on a plain message] | |
+| =text=         | string; joined text/plain parts (=\n= newlines); html-to-text fallback when only HTML exists (unless =skipHtmlToText=) | |
+| =html=         | string; joined text/html parts; =cid:= image URLs rewritten to =data:= URIs unless =keepCidLinks= / =skipImageLinks= | |
+| =textAsHtml=   | string; =text= escaped + linkified into =<p>= (empty when =skipTextToHtml=) | |
+| =attachments=  | =Attachment[]= (6.2)                                          | |
+Not present: =list= is inside =headers= (='list'= key, normalised ={help, unsubscribe, ...}=);
+=deliveredTo= / =returnPath= are address objects in =headers= only. Embedded =message/rfc822=
+parts: their headers are rendered as a =mp_head= table / "From: …" block at the top of the
+nested text/html ("showMeta"), and their attachments are flattened into =attachments= [SRC].
+
+** 6.2 Attachment object (simpleParser) [SRC processChunk][PROBE]
+={type: 'attachment', content: Buffer, contentType, partId: "1.2.2", release: null (consumed),
+contentDisposition: 'attachment'|'inline', filename?, contentId?: "<logo@x>", cid?: "logo@x",
+related?: true (an ancestor is multipart/related — i.e. referenced from html), headers: Map
+(the part's own headers, parsed like 6.3), checksum: hex (md5 default; =checksumAlgo=), size:
+bytes (decoded)}=. =application/octet-stream= with a filename is re-typed from the extension
+(=libmime.detectMimeType=). What counts as an attachment: any non-multipart part whose type
+is not text/plain, text/html (or message/delivery-status unless =keepDeliveryStatus=), OR a
+text part with =Content-Disposition: attachment= [SRC createNode]. The probe round-trip
+(nodemailer -> mailparser) produced exactly the three attachments sent, with the cid image
+=related: true= and =contentDisposition: 'inline'=.
+
+** 6.3 Headers Map value rules [SRC processHeaders][PROBE]
+- Every header value is RFC 2047-decoded and trimmed; repeated headers become arrays (=x-lower
+  -> ['a','b']=), except the "single" keys (=message-id=, =content-id=, =from=, =sender=,
+  =in-reply-to=, =reply-to=, =subject=, =date=, =content-disposition=, =content-type=,
+  =content-transfer-encoding=, =priority=, =mime-version=, =content-description=, =precedence=,
+  =errors-to=, =disposition-notification-to=) which keep the LAST occurrence.
+- Structured: =content-type= / =content-disposition= / =dkim-signature= ->
+  ={value: "multipart/mixed", params: {boundary: "…", charset, name, filename}}=.
+- Addresses (=from to cc bcc sender reply-to delivered-to return-path
+  disposition-notification-to=) -> ={value, html, text}= as in 6.1; IDN domains decoded to
+  Unicode; RFC 2047 words inside addr-spec are rejected (address blanked) — security fix.
+- =date= -> =Date= (invalid -> now); =references= -> array; =message-id= / =in-reply-to= ->
+  bracket-normalised; priority family -> ='priority'=; =list-*= -> ='list'= object.
+- Everything else -> string (or array).
+
+** 6.4 =MailParser= stream class [SRC mail-parser.js][DOC]
+Transform stream (object mode readable). Events: ='headers'= (Map), ='headerLines'=, ='data'=
+objects: ={type: 'attachment', content: Readable, release(), filename, contentType, partId,
+contentDisposition, contentId, cid, related, headers}= (checksum/size only after the content
+stream ends) — *parsing pauses until =release()= is called* (back-pressure); then one
+={type: 'text', text, html, textAsHtml}= at the end; ='end'=; ='error'= (also emitted for "HTML
+too long" and "Failed to parse HTML", after which text gets a placeholder). Order observed
+[PROBE]: headers -> attachments (in document order) -> text. This is the streaming parse the
+library exposes as a channel in phase 4 (9.4).
+
+** 6.5 Options (both APIs) [DOC][SRC]
+=skipHtmlToText=, =maxHtmlLengthToParse= (default Infinity; exceeding -> 'error' event ->
+simpleParser rejects), =formatDateString=, =skipImageLinks=, =keepCidLinks= (simpleParser),
+=skipTextToHtml=, =skipTextLinks=, =keepDeliveryStatus=, =checksumAlgo= ('md5' default),
+=Iconv= (node-iconv injection). Charsets: iconv-lite for everything except JIS/ISO-2022-JP/EUCJP
+(encoding-japanese); labels normalised via libmime (=iso-8859-8-i= -> ISO-8859-8); the
+hyphenated =EUC-JP= label falls to iconv-lite (doc caveat). Unknown charset -> content left
+undecoded (12.3).
+
+* 7. MIME / message model
+** 7.1 Content types, transfer encodings, charsets [RFC 2045/2046/2047][DTS mime-node][PROBE]
+- Text parts: =text/plain; charset=utf-8= and =text/html; charset=utf-8=. nodemailer picks the
+  Content-Transfer-Encoding automatically: =7bit= for ASCII with lines <= 76 chars,
+  =quoted-printable= for mostly-ASCII text, =base64= otherwise (=textEncoding= tilts the
+  choice, =encoding= forces it). Attachments default to =base64= (=8bit= for =message/*=);
+  =contentTransferEncoding: false= lets nodemailer choose. [DOC message, attachments][PROBE:
+  ünïcode text -> quoted-printable, html without non-ASCII -> 7bit, png -> base64]
+- Header encoding: non-ASCII header values (Subject, display names, filenames) become RFC
+  2047 encoded-words (=?UTF-8?Q?…?= or =?UTF-8?B?…?=); filenames additionally via RFC 2231
+  when needed. mailparser decodes all of them; imapflow decodes ENVELOPE subject/names and
+  BODYSTRUCTURE params.
+- Charsets on the way in: mailparser converts every text part to UTF-8 via iconv-lite
+  (6.5); imapflow =download()= converts text parts to UTF-8 too (=meta.charset= reports the
+  original); raw =source= / =bodyParts= are untouched bytes.
+- Line endings: RFC 5322 requires CRLF on the wire; nodemailer's SMTP transport normalises
+  bare LF to CRLF while transmitting; the stream transport keeps what it generated
+  (=newline= option); mailparser normalises text bodies to =\n=.
+
+** 7.2 Multipart tree nodemailer builds (=MailComposer.compile=) [SRC mail-composer compile][PROBE]
+| Content present                                   | Root                                                        |
+|---------------------------------------------------+-------------------------------------------------------------|
+| text only / html only / one attachment only       | that single part                                            |
+| text + html                                       | =multipart/alternative= [text, html]                        |
+| html + cid attachments                            | =multipart/related; type="text/html"= [html, related…]      |
+| text + html + cid attachments                     | =multipart/alternative= [text, =multipart/related= [html, related…]] |
+| anything + regular attachments (>1, or >=1 with a body) | =multipart/mixed= [ (alternative | related | single body), attached… ] |
+| =raw=                                             | =message/rfc822= node emitting the raw bytes verbatim       |
+Alternative order is fixed: text, watchHtml, amp, html, icalEvent, then =alternatives[]=.
+Probe (text + html + 1 cid image + 2 attachments) produced exactly
+=mixed[ alternative[ text/plain(qp), related[ text/html(7bit), image/png(inline, cid) ] ],
+text/plain(attachment), application/octet-stream(attachment) ]= with parts numbered by
+mailparser as =1.2.2=, =2=, =3=.
+
+** 7.3 Inline vs attachment disposition and Content-ID [RFC 2183, RFC 2392][DOC attachments, embedded-images]
+- =contentDisposition= defaults to =attachment=; it is =inline= for =message/*= parts and for
+  *image* attachments that carry a =cid= (so an image with a cid but no html body still goes
+  out as an inline attachment under =multipart/mixed=, and a non-image with a cid stays
+  =attachment= but is still moved into =multipart/related= if there is html).
+- =cid= -> =Content-ID: <cid>= header; html references it as =src="cid:<cid>"=; the related
+  container is only built when the message has an =html= body.
+- On parse, mailparser gives =cid= (bare) + =contentId= (bracketed) + =related= (ancestor is
+  multipart/related) and rewrites =cid:= URLs in =html= to =data:<type>;base64,…= unless told
+  not to. The library defaults to KEEPING cid links (=keepCidLinks: true=) and exposing the
+  =cid= on the attachment map, so the caller decides (12.8 explains the memory reason).
+
+** 7.4 Address and date formats [RFC 5322 §3.3/§3.4][PROBE]
+- Address wire forms: =addr-spec= (=a@b.c=), =name-addr= (=Name <a@b.c>=, quoted-string names
+  ="Doe, John" <a@b.c>=), groups (=Team: a@b, c@d;=), obsolete forms. nodemailer renders
+  ={name, address}= with quoting/encoding as needed (="Doe, John" <john@example.com>= and
+  ==?UTF-8?B?QsOp?= <b@example.com>= in the probe). addressparser handles quoted commas,
+  groups, and tries to recombine unquoted =Doe, John <a@b>= (heuristic; 12.1). RFC 2047 in
+  a display name is NOT decoded by addressparser itself (probe: name stayed
+  ==?UTF-8?Q?J=C3=BCrgen?==); mailparser decodes it in =decodeAddresses=.
+- Dates: wire =Date: Thu, 24 Sep 2026 23:08:56 +0000= (RFC 5322 date-time; nodemailer writes
+  UTC). mailparser -> JS =Date= (invalid -> now); imapflow ENVELOPE =date= -> =Date= (invalid ->
+  raw string); =internalDate= (server receipt time, the value SEARCH SINCE/BEFORE use) ->
+  =Date=. The library renders every date as an ISO-8601 UTC string (14.2) and keeps
+  =:internal-date= separate from the header =:date= (12.4).
+
+** 7.5 What mailparser resolves automatically vs what stays raw
+Resolved: RFC 2047 words, charsets to UTF-8, transfer encodings (attachment =content= is
+decoded bytes), format=flowed text (=FlowedDecoder=), quoted-printable soft breaks, IDN
+domains, message-id normalisation, priority normalisation, nested rfc822 flattening, cid
+-> data URI. Raw: =headerLines= (exact lines), attachment =headers= Map (parsed like the
+top-level), unknown charsets (bytes as-is), DKIM signature (parsed to value/params only,
+not verified), no HTML sanitising (caller's job — the docs warn about XSS).
+
+* 8. Error taxonomy -> =:email-cljs/*= (implemented in =util.cljs=, phase 0)
+** 8.1 nodemailer (=NodemailerError=) [DTS errors.d.ts][DOC errors][SRC _formatError]
+Shape: =Error= + =code= (ErrorCode string) + =command= + =response= + =responseCode= + (for
+recipient errors) =recipient=, =rejected[]=, =rejectedErrors[]=, (fetch) =sourceUrl=.
+| =code=          | Meaning                                              | Retryable | -> email-cljs type                         |
+|-----------------+------------------------------------------------------+-----------+--------------------------------------------|
+| =ECONNECTION=   | connect failed / closed unexpectedly / 421           | yes       | =:network-error= =:code "ECONNECTION"=      |
+| =ETIMEDOUT=     | connection / greeting / socket inactivity timeout    | yes       | =:network-error= =:retryable? true=          |
+| =EDNS=          | hostname did not resolve                             | maybe (config) | =:network-error= (=:config-error= only when the host is syntactically bad) |
+| =ESOCKET=       | ECONNRESET / EPIPE from net/tls                      | yes       | =:network-error=                            |
+| =ETLS=          | TLS handshake / STARTTLS / certificate               | no        | =:network-error= =:tls? true=               |
+| =EREQUIRETLS=   | REQUIRETLS not possible                              | no        | =:smtp-error=                               |
+| =EAUTH=         | credentials rejected; =command= AUTH …; 535/534/454 | no (454 yes) | =:auth-error= =:protocol :smtp=          |
+| =ENOAUTH=       | server needs AUTH, none configured (forceAuth)       | no        | =:config-error= =:reason :missing-credentials= |
+| =EOAUTH2=       | token problems                                       | no        | =:auth-error=                               |
+| =EENVELOPE=     | no recipients / bad sender or recipient syntax (=API=) / MAIL FROM or RCPT TO refused / all recipients rejected / DATA refused | per =responseCode= | =:smtp-error= with =:rejected= =:accepted= =:rejected-errors= |
+| =EMAXRECIPIENTS= | over =maxRecipients=                                | no        | =:argument-error=                           |
+| =EMESSAGE=      | empty message / larger than SIZE / DATA end refused (=response= carries the 5xx) | per code | =:smtp-error= |
+| =ESTREAM=       | content stream / file / URL read failed              | no        | =:parse-error= (content source) or =:argument-error= |
+| =EPROTOCOL=     | not an SMTP server / bad greeting                     | no        | =:network-error= (=:protocol-violation? true=) |
+| =EMAXLIMIT=     | pool connection hit =maxMessages= (internal)         | -         | never surfaces normally                    |
+| =ECONFIG=       | invalid transport config                              | no        | =:config-error=                             |
+| =EPROXY= =EFILEACCESS= =EURLACCESS= =EFETCH= =ESENDMAIL= =ESES= | proxy / disabled content sources / fetch / other transports | no | =:argument-error= (file/url access refused by the library's defaults) / =:config-error= |
+| (no code) "Connection pool was closed" / "Reached maximum number of retries…" | pool shutdown / requeue exhaustion | yes | =:network-error= |
+The binding copies =code=, =command=, =response=, =response-code=, =recipient=, =rejected=,
+=accepted= (from the envelope when present), and never the auth object.
+
+** 8.2 imapflow (=ImapFlowError= / =AuthenticationFailure=) [DTS errors.d.ts][SRC]
+| Signal                                                 | -> email-cljs type                                   |
+|--------------------------------------------------------+------------------------------------------------------|
+| =authenticationFailed: true= / instance of =AuthenticationFailure= (=serverResponseCode= =AUTHENTICATIONFAILED=) | =:auth-error= =:protocol :imap= =:response= =:server-response-code= |
+| =tlsFailed: true=, codes =UPGRADE_TIMEOUT= =STARTTLS_INJECTION= | =:network-error= =:tls? true=                     |
+| codes =CONNECT_TIMEOUT= =GREETING_TIMEOUT= =ETIMEOUT= =EConnectionClosed= =NoConnection=, BYE (=reason=) | =:network-error= =:retryable? true= (NoConnection: =:reason :not-connected=, not retryable — the client must reconnect) |
+| =ETHROTTLE= (+ =throttleReset= ms)                      | =:imap-error= =:retryable? true= =:retry-after-ms=    |
+| =responseStatus 'NO'= (command refused: nonexistent mailbox =mailboxMissing= / =TRYCREATE=, =ALREADYEXISTS=, =OVERQUOTA=, permission, =EXPUNGEISSUED=, =LIMIT=) | =:imap-error= =:response-status "NO"= =:server-response-code= =:command= =:path= |
+| =responseStatus 'BAD'= (protocol / syntax: the library's bug or server quirk) | =:imap-error= =:response-status "BAD"= |
+| =LockTimeout= (=acquireTimeout= elapsed)                | =:imap-error= =:reason :lock-timeout= =:retryable? true= |
+| =MissingServerExtension=                                | =:argument-error= =:reason :missing-server-extension= (the query used a feature the server lacks) |
+| =InvalidSequenceSet= =InvalidStringValue= =InvalidTextValue= =InvalidTokenValue= | =:argument-error=                     |
+| =LineTooLarge= =LiteralTooLarge= =ResponseTooLarge= =DownloadOverflow= =MAX_IMAP_NESTING_REACHED= | =:imap-error= =:reason :limit-exceeded= (connection is dead for the first three) |
+| parser codes (=InvalidResponse= =UnexpectedTag= =ParserErrorExchange= =ResponseProcessingFailed= =COMPRESS_TRAILING_DATA=) =PollFailed= | =:imap-error= =:reason :protocol= |
+| =NotFound= (part not found on download)                 | =:imap-error= =:reason :not-found=                     |
+| ='error'= event without a pending command                | delivered on the watcher channel as ={:event :error}= and the connection marked closed (10.2) |
+The binding copies =code=, =command=, =path=, =response-status=, =response-text=,
+=server-response-code=, =executed-command= (safe: credentials are masked by imapflow's
+logger, but the library still drops =executedCommand= for AUTH/LOGIN commands — 12.11).
+
+** 8.3 mailparser edge cases [SRC][DOC]
+| Signal                                                     | -> email-cljs type / behaviour                          |
+|------------------------------------------------------------+---------------------------------------------------------|
+| ='error'= event / simpleParser rejection: "HTML too long for parsing N bytes" (=maxHtmlLengthToParse=), "Failed to parse HTML", stream/decoder errors, =TypeError= on null input | =:parse-error= =:reason :html-too-long= / =:html= / =:input= |
+| unparseable =Date:= -> silently *now*                       | the library re-parses =headerLines= for =date= and sets =:date nil= + =:date-raw "…"= when mailparser substituted now (12.5) |
+| unknown charset -> bytes passed through undecoded           | =:charset= kept on the part; no error (12.3)             |
+| attachment without filename                                 | =:filename nil= (no synthetic name; nodemailer would have generated =attachment-N.ext= on send) |
+| =message/rfc822= part                                       | flattened: its attachments appear in =:attachments= with =:part-id= inside the nested numbering; its headers appear as text/html preamble |
+| RFC 2047 in addr-spec, IDN                                  | address blanked / decoded (security fixes) — surfaced as-is |
+| empty / headers-only message                                | =:text nil :html nil :attachments []=                     |
+
+** 8.4 The house types (=util/error-types=) and what each carries
+| Type                       | Constructor            | Data keys                                                                 |
+|----------------------------+------------------------+---------------------------------------------------------------------------|
+| =:email-cljs/config-error= | =config-error=         | =:reason= (=:missing-credentials= =:secrets-file-unreadable= =:secrets-file-incomplete= =:bad-host= =:bad-port=), =:secrets-file= (path only) |
+| =:email-cljs/argument-error= | =argument-error=     | =:reason=, the offending key                                              |
+| =:email-cljs/auth-error=   | =auth-error=           | =:protocol :smtp|:imap=, =:code=, =:response=, =:response-code=, =:server-response-code= |
+| =:email-cljs/network-error= | =network-error=       | =:protocol=, =:code=, =:retryable?=, =:tls?=, =:host= =:port=, =:cause= (message string only) |
+| =:email-cljs/smtp-error=   | =smtp-error=           | =:code= =:command= =:response= =:response-code= =:retryable?= (derived from the code class) =:rejected= =:accepted= =:rejected-errors= |
+| =:email-cljs/imap-error=   | =imap-error=           | =:code= =:command= =:path= =:response-status= =:response-text= =:server-response-code= =:reason= =:retryable?= =:retry-after-ms= |
+| =:email-cljs/parse-error=  | =parse-error=          | =:reason=, =:part-id=                                                     |
+Predicates: =error?=, =error-type=, =error-data=, =retryable?=. Secret material never enters
+error data (the auth object is built inside the binding and discarded).
+
+* 9. Attachment handling under the no-interop rule
+** 9.1 Building: nodemailer attachment object [DTS MailComposerAttachment][DOC attachments]
+={filename?: string|false, content?: string|Buffer|Readable, path?: string (file / http(s) /
+data: URI), href?: string, httpHeaders?, tls?, encoding?: 'base64'|'hex'|'utf8'|… (how to
+decode a string =content=), contentType?: auto from filename, contentDisposition?:
+'attachment'|'inline', cid?, contentTransferEncoding?: 'base64'|'quoted-printable'|'7bit'|'8bit'|false,
+headers?, raw?}=. Data URIs are limited to 50 MB encoded [DOC]. WHATWG ReadableStream is not
+accepted (Node =Readable= only).
+
+** 9.2 The library's attachment input map (kebab) and how it reaches nodemailer
+| Caller writes                                         | Binding produces                                   |
+|-------------------------------------------------------+----------------------------------------------------|
+| =:content "text"= (string)                            | =content: "text"= (utf8)                           |
+| =:content "SGVsbG8=" :encoding :base64=               | =content: "SGVsbG8=", encoding: "base64"= (nodemailer decodes) |
+| =:bytes <byte-array or Uint8Array-like opaque>=       | =content: Buffer.from(bytes)= — only the binding touches Buffer |
+| =:path "/abs/file.pdf"=                               | =path= — *refused by default* (=disableFileAccess=) unless the client is built with =:allow-file-access? true= (11.4) |
+| =:href "https://…"=                                   | =href= — refused by default (=disableUrlAccess=)    |
+| =:stream <opaque stream handle from attachment/stream…>= | =content: <Readable>= (handle created by the binding, so no interop at the call site) |
+| =:filename :content-type :content-disposition :cid :content-transfer-encoding :headers= | camelised 1:1 |
+Base64 strings are the primary no-interop representation for binary content: they are plain
+CLJS strings, serialise to EDN/JSON, and nodemailer decodes them itself. Byte arrays
+(=js/Uint8Array= is what =(byte-array …)= is NOT in CLJS — CLJS has no =byte-array=; a
+=js/Uint8Array= or a vector of ints) are accepted as an opaque =Bytes= wrapper created by
+=email-cljs.attachment/bytes= (14.4) so callers who already hold binary data need no interop.
+
+** 9.3 Reading: three sources of attachment bytes
+| Source                               | Shape from the package                                  | Library exposure |
+|--------------------------------------+---------------------------------------------------------+------------------|
+| mailparser =simpleParser=            | =content: Buffer= (decoded), =size=, =checksum=          | =:content= = opaque =Bytes= wrapper (prints as =#email-cljs/bytes {:size N}=) + =:content-base64= on demand via =attachment/->base64= (not eagerly: memory) + =attachment/->string= (charset aware) + =attachment/write-file!= |
+| imapflow =download(uid, part)=       | ={meta {contentType charset disposition filename encoding expectedSize flowed delSp}, content: Readable}= decoded | =imap/download!= -> promise of the same attachment map with =:content Bytes= (binding drains the stream), plus =imap/download-chan= (core.async channel of byte chunks as =Bytes=) for large parts; =:max-bytes= honoured |
+| imapflow =fetch {bodyParts}= / =source= | =Map<string, Buffer>= raw (transfer-encoded unless BINARY) / =Buffer= | =:source= as =Bytes=; the library does not expose =bodyParts= raw (use =download!= which decodes) except =:headers=, which the binding parses into the 6.3 header map by running mailparser over the header block |
+Why an opaque wrapper and not always base64: a base64 string of a 25 MB attachment is 33 MB
+of JS string plus the Buffer — doubling memory per attachment; the wrapper keeps ONE Buffer
+and converts lazily. Both representations exist (=Bytes= in, base64 out on request), per the
+brief's "both?" question: *yes, both, with =Bytes= as the carrier and base64 as the
+serialisable view*.
+
+** 9.4 Size limits and streaming
+- SMTP: server =SIZE= extension (in =info.ehlo=); nodemailer refuses up-front with EMESSAGE
+  "Message size larger than allowed" when it can compute the size; otherwise the 552 at DATA
+  surfaces as EMESSAGE. Attachments of any size stream from =path=/=Readable= without
+  buffering; base64 strings and =Bytes= are in memory.
+- IMAP: =APPENDLIMIT= (capability / =mailbox.appendlimit=) for =append!=; =maxLiteralSize=
+  (default 1 GB) bounds what a FETCH may push into memory — the library defaults it to
+  256 MB (13.14) and uses =download()= (chunked =chunkSize= 64 KB, =maxBytes=) rather than
+  =source= for big messages.
+- mailparser: streaming =MailParser= keeps attachments as streams with back-pressure
+  (=release()=); simpleParser buffers everything. Phase 4 exposes =message/parse-chan= (a
+  core.async channel of ={:event :headers|:attachment|:text|:end|:error}= where each
+  attachment carries its own chunk channel) for the streaming path, and =message/parse!=
+  (simpleParser) for the common case.
+
+* 10. IDLE -> core.async design
+** 10.1 Constraints from imapflow [DTS][SRC 4.5][DOC]
+1. One connection = one command at a time. =idle()= occupies the connection until broken; any
+   other command on the same connection breaks it (sends DONE) transparently (=preCheck=),
+   runs, and auto-IDLE (if enabled) re-arms 15 s later — but only when no lock is held.
+2. Events (='exists'=, ='expunge'=, ='flags'=) are emitted on the client whenever the
+   untagged responses arrive, inside or outside IDLE. ='exists'= is the only "new mail"
+   signal: it carries the new =count= and =prevCount=, NOT the message. Fetching the new
+   messages is a separate command (=UID SEARCH UID <uidNext-before>:*= or =FETCH <prevCount+1>:*=).
+3. =idle()= resolves when the session ends (DONE acknowledged, server-terminated, or close);
+   with =maxIdleTime= imapflow restarts internally so one =idle()= call can span many sessions.
+4. No auto-reconnect: ='close'= means the watcher is over; ='error'= usually precedes it.
+5. Holding =getMailboxLock= disables auto-IDLE; calling =idle()= manually while holding the
+   lock works (the lock only gates auto-IDLE via =connectionBusy=; a manual =idle()= is a
+   command like any other) — 13.15 verifies this live because it is the crux of the design.
+
+** 10.2 House design: =imap/watch!= returns a channel
+#+begin_src clojure
+(imap/watch! conn "INBOX" {:buffer 64 :fetch? true :query {:envelope true :flags true}})
+;; => core.async channel; events (kebab maps):
+{:event :open     :mailbox {:path "INBOX" :exists 42 :uid-next 1001 :uid-validity "17…"}}
+{:event :exists   :path "INBOX" :count 43 :prev-count 42}
+{:event :new-mail :path "INBOX" :uids [1001] :messages [{:uid 1001 :seq 43 :envelope {...} :flags #{"\\Seen"}}]} ; only with :fetch? true
+{:event :expunge  :path "INBOX" :uid 998 :seq nil :vanished? true}   ; seq-only when the server has no QRESYNC
+{:event :flags    :path "INBOX" :uid 1000 :seq 42 :flags #{"\\Seen" "\\Flagged"} :modseq "5"}
+{:event :idle-restart :path "INBOX"}                                 ; each maxIdleTime cycle
+{:event :error    :error <ex-info :email-cljs/imap-error|:network-error>}
+{:event :close    :path "INBOX" :reason "BYE …" | nil}               ; channel is closed right after
+#+end_src
+Mechanics (all inside =email-cljs.imap-binding=):
+- The watcher owns a *dedicated* =ImapFlow= connection (=:connection= option may pass one, but
+  the default is to open a second connection from the same client config): a connection in
+  IDLE cannot serve the caller's fetches without DONE/IDLE churn, and a fetch inside the
+  watcher's own event handling would deadlock if the caller is mid-=fetch= on that
+  connection. Cost: one extra TLS session per watched mailbox; benefit: no cross-talk.
+- =disableAutoIdle: true= on every connection the library opens (10.1 point 1: explicit
+  control), =qresync: true= (UID expunges), =maxIdleTime= 29 min default (13.10).
+- Loop: =connect= -> =mailboxOpen(path, {readOnly: true})= -> put =:open= -> =loop= (=idle()=
+  -> when it resolves and the connection is usable, put =:idle-restart=, repeat). Listeners on
+  ='exists'= / ='expunge'= / ='flags'= translate payloads and =put!= them; on ='exists'= with
+  =:fetch? true= the loop breaks IDLE by running =fetchAll("<prevCount+1>:*", query)= (a
+  command on the watcher's own connection — allowed because the watcher is not iterating a
+  =fetch= generator) and puts =:new-mail=; then =idle()= again.
+- Back-pressure: =put!= with a dropping/sliding buffer chosen by the caller (=:buffer= n
+  -> =(async/chan (async/sliding-buffer n))= default; =:buffer :block= uses an unbuffered
+  channel and =>!= inside a =go= so a slow consumer pauses the loop — untagged events are
+  still received and applied by imapflow, only the *forwarding* pauses).
+- Stop: =imap/stop-watch!= (or closing the channel from the consumer side: the loop checks
+  =(async/put! …)= returning false) -> =logout()= (or =close()= after a timeout), then the
+  channel is closed. Process liveness: the pending =idle()= promise + the open socket keep
+  Node alive; imapflow's own timers are unref'd, which is fine.
+- Errors: ='error'= -> =:error= event; ='close'= -> =:close= event -> channel closed. The
+  watcher never reconnects (house rule: the caller decides; a =imap/watch-forever!= helper
+  with backoff is a phase-3 candidate, 13.16).
+
+** 10.3 Why QRESYNC and why not =expungeHandler=
+=expungeHandler= replaces the event (it is for servers that need the client to *acknowledge*
+each expunge before the next command); the event form is enough for a channel. QRESYNC turns
+seq-only expunges into UID expunges (=vanished: true, uid=), which is what a UID-first API
+needs; when the server lacks QRESYNC the event carries only =seq= and the library reports
+=:uid nil= with =:seq= — consumers keeping a seq->uid map must apply them in order (12.7).
+
+* 11. Message building: nodemailer model vs raw
+** 11.1 =message/build= input (kebab, phase 2) -> =SendMailOptions= [2.4]
+#+begin_src clojure
+{:from {:name "Doe, John" :address "john@example.com"}     ; or "john@example.com" or "Doe <j@x>"
+ :to ["a@example.com" {:name "Bé" :address "b@example.com"}]
+ :cc "c@example.com" :bcc ["hidden@example.com"] :reply-to "…" :sender "…"
+ :subject "Ünïcode ✓" :text "plain" :html "<p>hi <img src=\"cid:logo@x\"></p>"
+ :in-reply-to "<id@x>" :references ["<a@x>" "<b@x>"] :message-id "<mine@x>" :date #inst "…"
+ :priority :high :headers {"X-Custom-Header" "v1" "X-Lower" ["a" "b"]}
+ :attachments [{:filename "a.txt" :content "hello" :content-type "text/plain"}
+               {:filename "logo.png" :content "iVBORw0KGgo=" :encoding :base64 :cid "logo@x"}
+               {:filename "big.bin" :bytes (attachment/bytes …)}]
+ :envelope {:from "bounce@example.com" :to ["a@example.com"]}     ; optional override
+ :encoding :quoted-printable :text-encoding :base64 :x-mailer false}
+#+end_src
+Translation rules (14.1): keys camelised; keyword enum values rendered as strings (=:high= ->
+="high"=, =:base64= -> ="base64"=); =:headers= passed verbatim (user-owned, string keys kept);
+address maps camelised (=:name= =:address= are single words anyway); =:date= inst -> =Date=
+(binding); =:attachments= translated element-wise with the 9.2 rules.
+
+** 11.2 Output of =message/build= (no transport): a map of bytes + metadata
+=(message/build msg)= -> promise of ={:source <Bytes> :message-id "<…>" :envelope {:from :to}
+:size N}= via =MailComposer.compile().build()= + =getEnvelope()= + =messageId()= — used for
+=imap/append!= (drafts, Sent copies: SMTP does not store a copy in Sent — 12.12) and tests.
+=(message/build-string msg)= -> promise of the RFC 822 string (=newline :unix= for tests).
+
+** 11.3 Raw messages
+=:raw= (string / =Bytes=) sends verbatim; =:envelope= is then mandatory (=:argument-error=
+before any network call, since nodemailer would only fail at =API= time). Per-attachment
+=:raw= (pre-built MIME node) and per-alternative =:raw= are passed through; documented as
+"you own the headers".
+
+** 11.4 Security defaults the library enforces
+=disableFileAccess: true= and =disableUrlAccess: true= on every transport AND message unless
+the client is created with =:allow-file-access? true= / =:allow-url-access? true=; a message
+using =:path= / =:href= is rejected with =:argument-error :reason :file-access-disabled= before
+the send (nodemailer would return EFILEACCESS/EURLACCESS). Reason: message maps often come
+from JSON; =path= would read any file the process can read.
+
+* 12. Pitfalls
+1. *Commas in display names.* ='Doe, John <a@b>'= unquoted splits into a bogus "Doe" entry
+   unless nodemailer's heuristic recombines it (it does only when an angle-bracket address
+   follows). Always emit ={:name :address}= maps from the library and quote when rendering
+   (=addressparser= round-trips ="Doe, John" <a@b>= correctly [PROBE]). Parsing user-supplied
+   strings: expose =message/parse-addresses= (addressparser) and document the quoting rule.
+2. *RFC 2047 in names.* addressparser leaves encoded-words in =name= (probe: ==?UTF-8?Q?J=C3=BCrgen?==);
+   only mailparser decodes them. The library's parse path goes through mailparser (or
+   =libmime.decodeWords= in the binding) so callers never see encoded-words.
+3. *Charsets beyond UTF-8.* mailparser decodes via iconv-lite (hundreds of charsets, incl.
+   windows-125x, ISO-8859-x, KOI8, GBK, Shift_JIS, EUC-KR); JIS family via encoding-japanese;
+   the =EUC-JP= label (hyphenated) falls to iconv-lite (fine, iconv-lite supports it); unknown
+   labels pass bytes through undecoded. Search strings with non-ASCII need UTF-8 CHARSET
+   support on the server (imapflow sends CHARSET UTF-8 when needed; Dovecot ok — 13.17).
+4. *Search dates and time zones.* SINCE/BEFORE/ON are date-only, compared against
+   INTERNALDATE in the server's zone; SENTSINCE against the =Date:= header. imapflow formats
+   the JS Date with LOCAL date components. House rule: the library accepts =:since= as an
+   =#inst=, a ="YYYY-MM-DD"= string, or a JS-Date-free ={:year :month :day}=; strings are passed
+   through untouched (imapflow accepts strings) so the caller controls the day; insts are
+   converted with UTC components (documented) — 13.7.
+5. *Envelope =Date= vs =internalDate=.* The header date is whatever the sender wrote (can be
+   absent, wrong, in any zone; mailparser silently substitutes NOW for unparseable ones —
+   the library detects that by re-reading =headerLines= and reports =:date nil=). =internalDate=
+   is the server's receipt time and is what SEARCH SINCE uses; "newest" ordering must use UID
+   or =internalDate=, not the header.
+6. *Huge attachments / memory.* =simpleParser= and =fetch {source: true}= buffer everything;
+   =maxLiteralSize= caps a single literal at 1 GB by default — the library lowers it (13.14)
+   and prefers =bodyStructure= + =download()= per part. Data-URI conversion in mailparser
+   (=cid:= -> =data:=) creates a second base64 copy of every inline image inside =html= — the
+   library keeps cid links by default (7.3).
+7. *Expunge and sequence numbers.* CLOSE expunges; seq numbers shift with every EXPUNGE; a
+   cached ={seq -> uid}= map must be updated in event order. UID-first API + QRESYNC + read-only
+   opens for readers avoid most of it; =delete!= uses UID EXPUNGE (UIDPLUS) — on a server
+   without UIDPLUS it falls back to EXPUNGE, which also purges other =\Deleted= marks (13.11).
+8. *Inline image detection.* "Attachment" vs "inline" is a disposition, =related= tells
+   whether the part sits under multipart/related, and =cid= tells whether html can reference
+   it; all three are independent. The library exposes all three and a derived =:inline?=
+   (= disposition inline AND cid AND related).
+9. *EventEmitter 'error'.* An imapflow client with no ='error'= listener throws on emit and
+   crashes the process; the binding attaches one at construction, always.
+10. *imapflow logs to stdout by default* (pino JSON). The library passes =logger: false=
+    unless =:logger= (a map of fns) or =:log-chan= (core.async, via =emitLogs=) is given.
+11. *Credentials in errors/logs.* imapflow masks credential frames in =logRaw=; nodemailer's
+    =debug= logs the AUTH exchange base64 — the library never enables =debug=/=transactionLog=
+    from a boolean; only an explicit =:debug-logger= fn receives them, and =:executed-command=
+    is dropped from =:auth-error= data.
+12. *Sent folder.* SMTP delivery does not store a copy in =Sent=; clients do that with IMAP
+    APPEND. Phase 3 offers =(imap/append! conn "Sent" built-message #{"\\Seen"})= and phase 2's
+    =send!= accepts =:save-to-sent {:imap conn :mailbox "Sent"}= (13.18 for the smoke: does
+    the host auto-save? Dovecot does not; a Sieve/postfix setup might).
+13. *Send -> IMAP visibility latency.* Local delivery on the same box (postfix -> dovecot LMTP)
+    is typically sub-second but not synchronous with the SMTP 250; the smoke must poll
+    (=search {:header {"Message-ID" id}}= every 500 ms up to 30 s) or use the watcher — 13.1.
+14. *Pool vs single connection.* A pooled transport keeps sockets open until =socketTimeout=
+    (10 min) or =close()=; a process that forgets =close!= keeps Node alive. Single-connection
+    mode (default) opens/closes per message: simpler, slower, no lingering sockets. The
+    library defaults to single and exposes =:pool {:max-connections 5 :max-messages 100
+    :rate-limit n :rate-delta ms}= as an option (13.9).
+15. *Partial recipient rejection resolves, not rejects* (2.5): a =send!= caller must inspect
+    =:rejected=; the library adds =:all-accepted?= to the result and a =:strict? true= send
+    option that rejects with =:smtp-error= when =:rejected= is non-empty (after the message was
+    still delivered to the accepted ones — there is no way to undo).
+16. *=fetch()= generator deadlock.* No IMAP command may run while iterating =fetch()=; the
+    binding always drains with =fetchAll= (bounded ranges, the caller paginates with
+    =:uid-range= / =:limit=) or the async generator into a channel that the caller reads
+    *after* the generator finished — never a callback-per-message API that could issue
+    commands.
+17. *Flags dropped silently.* Adding a keyword the mailbox's =permanentFlags= does not allow
+    is a silent no-op in imapflow; the library checks =permanent-flags= (after open) and
+    rejects with =:argument-error :reason :flag-not-permitted= when neither the flag nor =\*=
+    is allowed.
+18. *bigint everywhere.* =uidValidity=, =highestModseq=, =modseq=, =changedSince=,
+    =unchangedSince= are BigInt; =js->clj= leaves them as BigInt objects which print oddly and
+    do not compare with =. The binding renders them as decimal strings and parses strings
+    back (14.2).
+19. *Maps and Sets.* imapflow returns =Set= (flags, labels, mailbox flags), =Map= (bodyParts,
+    uidMap, capabilities), mailparser returns =Map= (headers); =js->clj= does NOT convert them
+    (they become opaque). Every binding walks them explicitly (14.2).
+
+* 13. Uncertain / needs live verification (phase 5 unless noted)
+Each item names the recommended house position to implement *now* and what the smoke settles.
+1. *Send -> IMAP-visible latency on the smoke host.* Expect < 2 s (local postfix -> dovecot
+   LMTP) but unmeasured. Position: =send!= never waits; the smoke polls =search {:header
+   {"Message-ID" id}}= at 500 ms up to 30 s and records the observed delay; the watcher test
+   asserts an =:exists= event within the same window.
+2. *Server capabilities of the smoke host* (IDLE, CONDSTORE, QRESYNC, MOVE, UIDPLUS, QUOTA,
+   SPECIAL-USE, LIST-STATUS, STATUS=SIZE, APPENDLIMIT, BINARY, COMPRESS, IMAP4rev2, ID).
+   Position: the library is capability-agnostic; the smoke prints =capabilities= and the
+   inventory is updated with the row. Anything missing (e.g. no QRESYNC) only changes which
+   event shape (=:uid= vs =:seq= expunges) the smoke sees.
+3. *SMTP AUTH mechanisms advertised and the exact 535 text.* Position: let nodemailer pick
+   (PLAIN expected); the smoke runs one deliberately wrong-password =verify!= against the SMTP
+   port ONLY IF the operator agrees (it may trip fail2ban on the box — default: skip, note).
+4. *Catch-all routing.* Does mail to =smoke-test@borret.ro= land in the account's =INBOX= or in
+   a Sieve-sorted subfolder (e.g. =INBOX.smoke-test=)? Position: the smoke searches INBOX
+   first, then every =\Noselect=-free mailbox from =list=, and records the path.
+5. *TLS certificate of box.borret.ro:465/993.* Expected a valid public-CA (Let's Encrypt)
+   chain; not probed in this job (no live network). Position: =:tls= is never defaulted to
+   =rejectUnauthorized: false=; the smoke reads =tls.authorized= from imapflow and the
+   nodemailer handshake success; if the chain is private, the operator supplies =:ca= via
+   =BORRET_EMAIL_TLS_CA= (a new secrets key) rather than disabling validation. (=openssl
+   s_client= was allowed by the brief but conflicts with the no-live-probe rule; deferred.)
+6. *Empty search query.* =searchCompiler= returns =[]= for ={}= [PROBE]; whether imapflow's
+   SEARCH command then sends =ALL= (expected) or a malformed command is unverified offline.
+   Position: the library rejects an empty query with =:argument-error= unless =:all true= is
+   given explicitly, so the case never reaches imapflow.
+7. *Search date rendering / timezone.* imapflow formats Dates with local components (the
+    day-boundary risk described in 12.4). Position: accept strings verbatim, convert insts with UTC
+   components, and document; the smoke sends a message, searches =:since= today (UTC) and
+   yesterday, and checks both find it.
+8. *BODY.PEEK.* imapflow is believed to always fetch with =.PEEK= (no implicit =\Seen=).
+   Position: the smoke fetches a fresh message with =:source= and asserts =\Seen= is still
+   absent afterwards; if it is set, the library adds ={:peek? true}= handling (read-only open).
+9. *Pooling.* Whether the smoke host (postfix submission) tolerates a 5-connection pool and
+   what its per-connection message limit is. Position: default single-connection; =:pool=
+   opt-in; the smoke uses single.
+10. *=maxIdleTime= default.* imapflow's default is =false= (never restart) [SRC 283]; RFC 2177
+    says clients should re-issue IDLE at least every 29 minutes; Dovecot's default
+    =imap_idle_notify_interval= is 2 min (it sends =* OK Still here=), and NAT boxes drop idle
+    TCP at 5-15 min. Position: default =:max-idle-ms= 29 min (spec) and document 5 min for
+    NATed clients; the smoke runs a 3-minute IDLE and checks the connection survives.
+11. *UIDPLUS on the smoke host* (=UID EXPUNGE=, =APPENDUID=, =COPYUID=). Dovecot: yes.
+    Position: =delete!= documents the fallback; =append!= returns =:uid nil= when APPENDUID is
+    missing and the smoke asserts non-nil.
+12. *QUOTA numbers.* imapflow multiplies =storage= by 1024 [SRC quota.js 26/57] -> bytes;
+    =messages= as-is. Position: expose bytes; the smoke prints the quota (Dovecot with quota
+    plugin expected; =false= if absent).
+13. *Server-side SORT/THREAD.* imapflow has no SORT/THREAD command. Position: =none= in phase
+    3; client-side ordering by UID / =:internal-date= is offered; revisit only if a consumer
+    needs it (a raw-command escape hatch is NOT planned: it would need interop at the call
+    site or a string-DSL that re-invents imapflow).
+14. *=maxLiteralSize= default.* imapflow 1 GB; the library proposes 256 MB (=:max-literal-bytes=)
+    to bound a runaway server. Position: 256 MB default, configurable; the smoke does not
+    exercise it.
+15. *Manual =idle()= while a mailbox lock is held* (10.1 point 5). The source suggests it
+    works (lock gates only auto-IDLE), but the watcher design does not depend on it (it uses
+    =mailboxOpen= without a lock on its own connection). Position: watcher = own connection,
+    no lock; the smoke additionally runs one lock+idle cycle to record the behaviour.
+16. *Reconnect policy.* imapflow never reconnects. Position: =watch!= ends on =:close=; a
+    =watch-forever!= (exponential backoff, re-emits =:open=, resyncs by UID > last seen) is a
+    phase-3 candidate, decided after the smoke shows how often the host drops IDLE.
+17. *Non-ASCII search on the host.* Dovecot supports =CHARSET UTF-8= and =UTF8=ACCEPT=.
+    Position: nothing special; the smoke searches for a subject with =ü= and =✓=.
+18. *Sent copy.* Whether the host auto-saves outbound mail to =Sent= (unlikely). Position:
+    =send!= gets =:save-to-sent= (phase 3, after =append!= exists); the smoke checks =Sent=
+    after a send and records.
+19. *postal-mime as an alternative parser backend.* Not installed; API captured in 1.2.
+    Position: mailparser in phase 4; the parsed-message map is backend-neutral (14.3) — a
+    =email-cljs.parse-binding= swap is possible later. Re-evaluate if mailparser stops
+    receiving security updates.
+20. *Bcc header stripping over SMTP.* Types/docs say the SMTP transport removes =Bcc:= and the
+    stream transport keeps it; only the stream path was probed. Position: trust docs; the
+    smoke sends with =:bcc= to the catch-all and asserts the received message has no =Bcc:=.
+21. *ENVELOPE =date= type.* =Date= when parseable, raw string otherwise [SRC]; on the smoke
+    host with a well-formed =Date:= it is a Date. Position: the binding renders both cases to
+    ISO string / =:date-raw=.
+22. *Secrets file values.* Key names are known (=BORRET_EMAIL_USERNAME=, =_PASSWORD=,
+    =_SMTP_HOST=, =_SMTP_PORT=, =_SMTP_TLS=, =_IMAP_HOST=, =_IMAP_PORT=, =_IMAP_TLS=); the TLS
+    values' spelling (=true=/=1=/=yes=) is not — =util/parse-bool= accepts all of them.
+    Position: =core/client-from-env= reads =BORRET_EMAIL_*= (prefix configurable, default
+    =EMAIL_=), then =EMAIL_SECRETS_FILE=, then =~/.secrets/borret.txt=.
+23. *Concurrent connections per user.* Dovecot's default =mail_max_userip_connections= is 10;
+    the watcher design uses 2 (main + watcher). Position: fine; the smoke opens both and
+    records any =[LIMIT]= / =Maximum number of connections= NO.
+24. *nodemailer =ehlo= of the host* (SIZE limit, SMTPUTF8, DSN, PIPELINING). Position: the
+    smoke records =:ehlo= from the send result; =SIZE= feeds a documented attachment ceiling.
+
+* 14. Implementation notes for email-cljs
+** 14.1 Kebab <-> camelCase translation rules (=util.cljs=, done in phase 0)
+- Option maps: =util/->camel-keys= (nil values dropped, nested maps translated, keyword values
+  left to the binding which renders enums via =name=); passthrough subtrees (verbatim):
+  =:headers= (user-owned header names/values), =:content= / =:raw= (data), =:tls= (Node option
+  names are already camelCase and user-owned), =:auth= (built by the binding from the Secret,
+  never from the caller's map), =:params= / =:secret= / =:envelope= (=:envelope= keys are
+  single words; kept verbatim so extra DSN keys survive) / =:dkim=.
+- Result maps: =util/->kebab-keys= after the binding converted Map/Set/Buffer/BigInt/Date
+  (14.2); passthrough: =:headers= subtree keeps header names as given (lower-case strings
+  from mailparser), =:parameters= / =:disposition-parameters= of bodystructure keep the wire
+  param names (=charset=, =name=, =filename=, =boundary=).
+- Search DSL keys are already single words or camel (=sentSince=) -> =:sent-since=; header
+  names inside =:header= are user-owned (verbatim).
+- Enum values: =:high= / =:normal= / =:low=, =:base64= / =:quoted-printable=, =:attachment= /
+  =:inline=, =:plain= / =:login= / =:cram-md5= (SMTP =authMethod=), =:noop= / =:select= / =:status=
+  (=missingIdleCommand=) -> upper/lower-cased strings as each package expects (binding table).
+
+** 14.2 Value types crossing the binding boundary
+| JS (package)                     | CLJS (library)                                       | Where |
+|----------------------------------+------------------------------------------------------+-------|
+| =Buffer= (source, headers, attachment content, bodyParts) | opaque =Bytes= wrapper (=attachment/bytes=, =->base64=, =->string=, =size=) — prints =#email-cljs/bytes {:size N}= | attachment ns |
+| =Readable= stream                | core.async channel of =Bytes= chunks (=download-chan=, =parse-chan=) or drained to =Bytes= | bindings |
+| =Set<string>= (flags, labels, mailbox flags, permanentFlags, enabled, binaryParts) | =#{"\\Seen" …}= set of strings | imap-binding |
+| =Map= (headers, bodyParts, uidMap, capabilities) | map with string (headers/bodyParts) or keyword (capabilities: =:idle true :appendlimit 26214400=) keys; =uidMap= -> ={src-uid dst-uid}= with integer keys | bindings |
+| =BigInt= (uidValidity, highestModseq, modseq, changedSince) | decimal *string* (="1758758400"=); inputs accept string or integer | imap-binding |
+| =Date=                           | ISO-8601 UTC string (="2026-09-24T23:08:56.000Z"=); inputs accept =#inst= or ISO string | both |
+| =Error= (NodemailerError / ImapFlowError) | =ex-info= via =util/*-error= (section 8)           | bindings |
+| EventEmitter events              | core.async channel events (=:event= keyword)          | imap-binding |
+| Address ={name, address}=        | ={:name "…" :address "…"}= (empty name -> =:name nil=) | both |
+| Secret                           | =util/Secret= — revealed only inside =auth= construction | bindings |
+
+** 14.3 Result shapes (kebab, full examples)
+Parsed message (=message/parse!= and the =:fetch? true= watcher payload with =:parse? true=):
+#+begin_src clojure
+{:message-id "<b73299dd-…@example.com>"
+ :in-reply-to nil :references []
+ :subject "Ünïcode subject ✓"
+ :from {:name "Doe, John" :address "john@example.com"}          ; first From mailbox
+ :from-all [{:name "Doe, John" :address "john@example.com"}]     ; every From mailbox (rare >1)
+ :sender nil :reply-to []
+ :to [{:name nil :address "a@example.com"} {:name "Bé" :address "b@example.com"}]
+ :cc [{:name nil :address "c@example.com"}] :bcc []
+ :date "2026-09-24T23:08:56.000Z" :date-raw "Thu, 24 Sep 2026 23:08:56 +0000"
+ :priority :normal                                               ; :high/:normal/:low, :normal when absent
+ :text "plain body with ünïcode" :html "<p>hi <img src=\"cid:logo@x\"></p>" :text-as-html "<p>…</p>"
+ :headers {"x-custom-header" "v1" "x-lower" ["a" "b"] "content-type" {:value "multipart/mixed" :params {"boundary" "…"}} …}
+ :header-lines [{:key "x-custom-header" :line "X-Custom-Header: v1"} …]
+ :attachments [{:filename "logo.png" :content-type "image/png" :content-disposition :inline
+                :cid "logo@x" :content-id "<logo@x>" :related? true :inline? true
+                :part-id "1.2.2" :size 4 :checksum "3bdaf596…" :checksum-algo :md5
+                :content #email-cljs/bytes {:size 4} :headers {…}}
+               {:filename "a.txt" :content-type "text/plain" :content-disposition :attachment
+                :cid nil :related? false :inline? false :part-id "2" :size 5 :checksum "…"
+                :content #email-cljs/bytes {:size 5} :headers {…}}]}
+#+end_src
+Send result (=core/send!=):
+#+begin_src clojure
+{:message-id "<…>" :envelope {:from "john@example.com" :to ["a@example.com" "b@example.com"]}
+ :accepted ["a@example.com" "b@example.com"] :rejected [] :rejected-errors [] :all-accepted? true
+ :response "250 2.0.0 Ok: queued as 4XyZ…" :response-code 250
+ :ehlo ["PIPELINING" "SIZE 52428800" "8BITMIME" "SMTPUTF8" "AUTH PLAIN LOGIN"]
+ :envelope-time-ms 120 :message-time-ms 35 :message-size 1649}
+#+end_src
+IMAP fetched message (=imap/fetch!= with ={:envelope true :flags true :body-structure true :size true :internal-date true}=):
+#+begin_src clojure
+{:uid 1001 :seq 43 :modseq "77" :size 1649 :internal-date "2026-09-25T10:00:01.000Z"
+ :flags #{"\\Seen"} :flag-color nil
+ :envelope {:date "2026-09-24T23:08:56.000Z" :subject "…" :message-id "<…>" :in-reply-to nil
+            :from [{:name "Doe, John" :address "john@example.com"}] :sender [...] :reply-to []
+            :to [...] :cc [...] :bcc []}
+ :body-structure {:type "multipart/mixed" :parameters {"boundary" "…"}
+                  :child-nodes [{:part "1" :type "multipart/alternative" :child-nodes [...]}
+                                {:part "2" :type "text/plain" :parameters {"name" "a.txt"} :encoding "base64" :size 8
+                                 :disposition "attachment" :disposition-parameters {"filename" "a.txt"}}]}
+ :source nil :headers nil}        ; present as Bytes / parsed map only when requested
+#+end_src
+Mailbox list entry (=imap/list!=): ={:path "INBOX.Sent" :name "Sent" :parent-path "INBOX" :parent ["INBOX"]
+:delimiter "." :flags #{"\\HasNoChildren" "\\Sent"} :special-use "\\Sent" :special-use-source :extension
+:subscribed? true :listed? true :status {:messages 12 :unseen 0 :uid-next 13 :uid-validity "…"}}=.
+Mailbox status (=imap/status!=): ={:path "INBOX" :messages 43 :unseen 1 :uid-next 1002 :uid-validity "…"
+:highest-modseq "77" :size 123456}=. Quota: ={:path "INBOX" :storage {:used 10485760 :limit 1073741824}
+:messages {:used 43 :limit 100000}}= or =nil= (unsupported).
+
+** 14.4 Namespaces and public functions (phases 2-4)
+| Namespace                   | Phase | Public fns                                                                                       | Interop? |
+|-----------------------------+-------+--------------------------------------------------------------------------------------------------+----------|
+| =email-cljs.util=           | 0     | case translation, =secret= / =secret?= / =reveal= / =clean-secret= / =redact-config= / =parse-secrets-file= / =parse-bool=, =smtp-code-class= / =smtp-retryable?=, error constructors + predicates | no |
+| =email-cljs.core=           | 2     | =client= (config map: =:smtp {:host :port :tls? :auth-method :timeouts :pool :tls}=, =:imap {:host :port :tls? :tls :max-idle-ms :max-literal-bytes :qresync? :client-info}=, =:username= (Secret-free), =:password= (Secret), =:from= default, =:allow-file-access?=, =:allow-url-access?=, =:logger=), =client-from-env= / =client-from-secrets-file= (=BORRET_EMAIL_*= / =EMAIL_*= keys, 13.22), =can-auth?=, =send!= (message map -> promise of send result; =:strict?=, =:save-to-sent=), =verify-smtp!=, =verify-imap!=, =close!= (pool) | no (delegates) |
+| =email-cljs.smtp-binding=   | 2     | =create-transport=, =send-mail=, =verify=, =close=, =transport-events-chan= (idle/clear/error), =build-message-bytes= (MailComposer), =parse-address-list= (addressparser), =nodemailer-error->ex= | YES (all nodemailer interop) |
+| =email-cljs.message=        | 2/4   | =build= / =build-string= (11.2), =parse!= (bytes/string -> parsed map), =parse-chan= (streaming), =parse-addresses= / =format-address= / =format-addresses=, =normalize-message-id=, =attachment-of= (find by cid/filename), =inline-attachments= / =file-attachments=, =text-or-html= | no |
+| =email-cljs.parse-binding=  | 4     | =simple-parse=, =mail-parser-chan=, =header-block->map= (mailparser on a header Buffer), =mailparser-error->ex= | YES (mailparser + Buffer/Map) |
+| =email-cljs.attachment=     | 4     | =bytes= (from base64 / vector of ints / string+charset / opaque), =->base64=, =->string=, =size=, =bytes?=, =write-file!= / =read-file!= (promises; the ONLY fs use, gated by =:allow-file-access?= for =:path= sends but always allowed for explicit calls), =chunks->bytes=, =attachment= (constructor with validation: exactly one of =:content= / =:bytes= / =:path= / =:href= / =:raw=), =content-type-of= (extension lookup via nodemailer's mime-funcs — in the binding) | no — the Buffer/fs touches behind =bytes= / =->base64= / =write-file!= live in =email-cljs.parse-binding=, keeping the binding namespaces at three |
+| =email-cljs.imap=           | 3     | =connect!= / =disconnect!= (=logout=), =connection?= / =usable?=, =capabilities= / =enabled=, =list!= / =list-tree!= / =status!= / =quota!=, =create-mailbox!= / =rename-mailbox!= / =delete-mailbox!= / =subscribe!= / =unsubscribe!=, =with-mailbox= (lock, fn -> promise; =:read-only?=), =open!= / =close-mailbox!= / =mailbox= (current), =search!= (DSL 5.4, always UIDs; =:return [:count :max]=), =fetch!= (uids/range + query 5.5, =fetchAll=), =fetch-one!=, =fetch-source!= (Bytes), =fetch-headers!= (parsed), =download!= / =download-chan= / =download-many!= (9.3), =add-flags!= / =remove-flags!= / =set-flags!= / =mark-seen!= / =mark-unseen!= / =flag!= / =unflag!= (=:unchanged-since=, =:silent?=), =set-flag-color!=, =move!= / =copy!= / =delete!= / =expunge!= (=close-mailbox!= semantics documented), =append!=, =watch!= / =stop-watch!= (10.2), =new-uids-since= helper, =find-message-id!= (search by Message-ID, for the smoke), =mailbox-by-special-use= | no |
+| =email-cljs.imap-binding=   | 3     | =make-client=, =connect=, =logout=, =close=, every imapflow method wrapped 1:1 with Map/Set/BigInt/Buffer conversion, =events->chan= (listener plumbing), =idle-loop= (10.2), =imapflow-error->ex=, =range->js= (sequence sets), =search->js= (dates/bigints) | YES (all imapflow interop) |
+| =email-cljs.dev= / =smoke=  | 0 / 5 | dev runtime; smoke sections (15)                                                                 | smoke only |
+
+** 14.5 Phase outline
+- Phase 2 (=core= + =smtp-binding= + =message/build=): client config + secrets file, Secret
+  wiring into =auth=, single/pooled transports, =send!= with the 2.5 result and =:strict?=,
+  =verify-smtp!=, =message/build= via MailComposer, address parsing/formatting, security
+  defaults (11.4), error mapping (8.1). Tests: stream/json transports round-trip through
+  mailparser (already installed) — no network.
+- Phase 3 (=imap= + =imap-binding=): connection lifecycle, mailboxes, search DSL, fetch
+  shapes, flags, move/copy/delete/append, download, =watch!= channel (10.2). Tests: a fake
+  ImapFlow object (EventEmitter with scripted method results) injected through
+  =imap-binding/make-client=; the search/fetch translators tested pure; =searchCompiler=
+  invoked offline with a fake connection (as in the probe) to assert wire attributes.
+- Phase 4 (=message/parse!= + =parse-binding= + =attachment=): simpleParser and MailParser
+  channel, Bytes wrapper, base64/string views, file helpers, cid/inline logic, charset
+  reporting, edge cases (8.3). Tests: canned RFC 822 fixtures (nested multipart, 8-bit
+  charsets, quoted-printable, rfc822 attachment, bad Date, missing filename).
+- Phase 5: live smoke (15). Phase 6: docs, README examples verified against the smoke.
+
+* 15. Phase 5 smoke plan (planning only; no network in this job)
+Credentials: =~/.secrets/borret.txt= (keys listed in 13.22; values never printed). Hosts:
+SMTP =box.borret.ro:465= implicit TLS, IMAP =box.borret.ro:993= implicit TLS; the account is a
+catch-all for =@borret.ro=, so the smoke sends to =smoke-test@borret.ro= and fetches it back.
+Sections (PASS/FAIL each, house style of openrouter's smoke):
+1. =client-from-env= loads; printing the client shows =<redacted>=.
+2. =verify-smtp!= (DNS+TLS+AUTH) and =verify-imap!= (=verifyOnly=) — records =tls.authorized=,
+   =capabilities=, =ehlo= (13.2, 13.5, 13.24).
+3. =send!= a text+html+inline-image+attachment message with a unique subject and Message-ID
+   to =smoke-test@borret.ro=, =:bcc= the account's own address (13.20); assert =:all-accepted?=.
+4. Poll =find-message-id!= across INBOX (then all mailboxes) until found; record latency
+   (13.1, 13.4).
+5. =fetch!= envelope/flags/body-structure/size/internal-date; assert =\Seen= absent (13.8);
+   =fetch-source!= + =message/parse!=; assert subject/text/html/attachments round-trip
+   byte-for-byte (checksums) and =:bcc= header absent.
+6. =download!= the image part by =:part-id= from body-structure; compare bytes.
+7. Flags: =mark-seen!=, =flag!=, custom keyword =$EmailCljsSmoke= (check =permanent-flags=),
+   =remove-flags!=; =search!= by =:seen=, =:keyword=, =:since= today/yesterday UTC (13.7), =:subject=
+   with =ü✓= (13.17), =:header {"Message-ID" …}=.
+8. =append!= the built message to =INBOX= with =\Seen=; assert =:uid= (13.11); =copy!= to a
+   created mailbox =email-cljs-smoke=, =move!= back, =delete!= the copy; =delete-mailbox!=.
+9. =watch!=: open the channel on INBOX, send a second message, assert =:exists= then
+   =:new-mail= within 30 s; =mark-seen!= from the main connection and assert a =:flags=
+   event; =delete!= and assert =:expunge= (=:uid= if QRESYNC, 13.2); keep IDLE 3 min
+   (13.10); =stop-watch!= closes the channel.
+10. =quota!= (13.12), =list!= with status, special-use map (Sent/Trash/Drafts) (13.18).
+11. Cleanup: delete both smoke messages (=delete!= by UID), leave the mailbox as found; print
+    the totals (messages sent: 2, bytes: ~4 KB).
+Safety: never loops sends; hard cap 3 messages per run; skips the wrong-password probe
+(13.3) unless =EMAIL_SMOKE_AUTH_NEGATIVE=1=.
+
+* 16. Sources
+** Installed packages (verified 2026-09-25)
+- =node_modules/nodemailer= 10.0.10 — =package.json= (exports map, engines), =README.md=,
+  =CHANGELOG.md= (10.0.0 breaking changes 2026-09-03 … 10.0.10 2026-09-14),
+  =dist/esm/nodemailer.d.ts=, =errors.d.ts=, =mailer/index.d.ts=, =mailer/mail-message.d.ts=,
+  =mail-composer/index.d.ts=, =mime-node/index.d.ts=, =smtp-transport/index.d.ts=,
+  =smtp-pool/index.d.ts=, =smtp-connection/index.d.ts=, =shared/index.d.ts=,
+  =addressparser/index.d.ts=, =json-transport/index.d.ts=, =stream-transport/index.d.ts=;
+  source =dist/cjs/smtp-connection/index.js= (error sites, =_formatError=, recipient
+  bookkeeping), =dist/cjs/smtp-transport/index.js= (=verify=, send info),
+  =dist/cjs/mail-composer/index.js= (=compile= tree), =dist/cjs/smtp-pool/*.js= (events).
+- =node_modules/imapflow= 2.0.6 — =package.json=, =README.md=, =CHANGELOG.md= (2.0.0
+  2026-09-07 … 2.0.6 2026-09-22; 1.7.x IDLE/lock fixes), =dist/esm/imap-flow.d.ts=,
+  =types.d.ts=, =errors.d.ts=, =search-compiler.d.ts=, =special-use.d.ts=; source
+  =dist/cjs/imap-flow.js= (=autoidle=, =connectionBusy=, lock release, =idle=, untagged
+  EXISTS/EXPUNGE/FETCH handlers, event emits), =dist/cjs/commands/idle.js= (IDLE session,
+  polling fallback, =maxIdleTime= restart), =commands/store.js= (flag permission),
+  =commands/quota.js= (KB -> bytes), =search-compiler.js= (key census), =tools.js= (flag
+  colors, envelope/internaldate parsing).
+- =node_modules/mailparser= 3.9.28 — =package.json= (deps incl. nested nodemailer 10.0.10),
+  =README.md= (maintenance-mode notice, PostalMime recommendation), =CHANGELOG.md=,
+  =lib/simple-parser.js= (whole file), =lib/mail-parser.js= (options, =processHeaders=,
+  =decodeAddresses=, =createNode=, =getTextContent=, =processChunk=, =_getPartId=).
+- =postal-mime= 3.0.0 tarball (npm pack into the job tmp dir; =postal-mime.d.ts=,
+  =package.json=) — not installed in the project.
+** Official docs (fetched 2026-09-25, Docusaurus HTML converted to text)
+- https://nodemailer.com/ (usage, response object, transporter events)
+- https://nodemailer.com/smtp (options, TLS, auth, verify)
+- https://nodemailer.com/smtp/pooled
+- https://nodemailer.com/smtp/envelope
+- https://nodemailer.com/message (all fields)
+- https://nodemailer.com/message/attachments
+- https://nodemailer.com/message/addresses
+- https://nodemailer.com/message/embedded-images
+- https://nodemailer.com/message/custom-headers
+- https://nodemailer.com/message/custom-source
+- https://nodemailer.com/message/alternatives
+- https://nodemailer.com/errors (codes, SMTP reply table, partial failures)
+- https://nodemailer.com/extras/mailparser (simpleParser / MailParser reference)
+- https://nodemailer.com/transports/stream (stream + JSON transports)
+- https://imapflow.com/docs/api/imapflow-client
+- https://imapflow.com/docs/guides/basic-usage
+- https://imapflow.com/docs/guides/configuration
+- https://imapflow.com/docs/guides/fetching-messages
+- https://imapflow.com/docs/guides/searching
+- https://imapflow.com/docs/guides/mailbox-management
+- Sitemaps: https://nodemailer.com/sitemap.xml (38 URLs), https://imapflow.com/sitemap.xml (13 URLs); neither site serves =llms.txt=.
+- npm registry: =npm view nodemailer|imapflow|mailparser|postal-mime= (dist-tags, versions, engines, modified times).
+** Offline probes (this session, no mail server contacted)
+- nodemailer streamTransport (buffer, unix newlines) + jsonTransport: message with
+  text/html/priority/custom headers/3 attachments (one cid) and a custom envelope; MIME tree
+  and headers captured (7.2); =addressparser= on quoted commas, groups, bare, RFC 2047 name.
+- mailparser =simpleParser= on that message (default and with =keepCidLinks= etc.), and
+  =MailParser= stream event order.
+- imapflow =searchCompiler= with a fake connection (CONDSTORE enabled): compound query, empty
+  query, invalid date.
+** Protocol references
+RFC 5321, 5322, 2045-2047, 2183, 2231, 2392, 3501, 9051, 2177, 7162, 4315, 2087/9208, 6154,
+5258, 3461, 6531, 8314, 8689, 3516, 4731, 9394, 8474.
