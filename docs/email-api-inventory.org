@@ -402,6 +402,7 @@ and =enabled= as a set of keywords (14.3).
 | =messageCopy/messageMove(range, destination, {uid?})= | ={path, destination, uidValidity?, uidMap?: Map<src,dst>} | false= | core | MOVE if capable else COPY+delete; =uidMap= needs UIDPLUS (COPYUID) |
 | =append(path, content, flags?, idate?)=            | ={destination, uid?, uidValidity?, seq?} | false= | core | =uid= needs UIDPLUS (APPENDUID) |
 | =unbind()=                                         | sockets                                  | none  | |
+| =exec(command, attributes?, options?)=             | =Promise<{response, next()}>= — the raw tagged-command runner every =commands/*.js= uses; public on the instance, undeclared in the =.d.ts= | binding-internal (phase 3: bare =EXPUNGE= and =UID EXPUNGE=, 17.3) | not a caller-facing escape hatch (13.13 stands) |
 
 ** 4.4 Events (=ImapFlowEvents=) [DTS types.d.ts][SRC emit sites]
 | Event          | Payload                                                                         | When |
@@ -524,9 +525,18 @@ command supplies the default) — 13.6. Options: ={uid: true}= (return UIDs), =r
 "1,5:10", partial?: {range, messages}, modseq?}= (imapflow emulates when the server lacks
 ESEARCH).
 Date/timezone: IMAP dates carry no time; the server compares against its own notion of the
-message's date in *its* timezone; imapflow renders the JS Date via its local components —
-so a query =since 2026-09-25= built at 00:30 local on a UTC+3 machine may be a day off from
-the server's view (12.4 / 13.7).
+message's date in *its* timezone. *Corrected in phase 3 [SRC tools.js formatDate /
+toValidDate, search-compiler.js processDateField, verified offline against the installed
+2.0.6]:* imapflow renders every date value from its *UTC* ISO components
+(=toISOString().substr(0, 10)=), NOT local components as this section first claimed — but
+it first runs EVERY value, strings included, through =new Date(value)=, so a string is not
+passed verbatim: ="24-Sep-2026"= is parsed as LOCAL midnight and comes out as
+=23-Sep-2026= on a UTC+3 machine, while ="2026-09-24"= (date-only ISO) is parsed as UTC
+midnight and survives. =BEFORE= / =SENTBEFORE= with a non-midnight time are shifted +24 h.
+Invalid strings compile to nothing (silently). House rule (12.4 / 13.7): =imap/search-date=
+normalises ="YYYY-MM-DD"=, ="DD-Mon-YYYY"=, =#inst= (UTC calendar day) and ={:year :month
+:day}= to the date-only ISO form and rejects anything else with =:argument-error
+:bad-search-date= before imapflow sees it.
 
 ** 5.5 Fetch query (=FetchQueryObject=) and result (=FetchMessageObject=) [DTS types.d.ts][DOC fetching]
 | Query key         | Result field                    | Result type                            |
@@ -871,15 +881,22 @@ serialisable view*.
 #+begin_src clojure
 (imap/watch! conn "INBOX" {:buffer 64 :fetch? true :query {:envelope true :flags true}})
 ;; => core.async channel; events (kebab maps):
-{:event :open     :mailbox {:path "INBOX" :exists 42 :uid-next 1001 :uid-validity "17…"}}
-{:event :exists   :path "INBOX" :count 43 :prev-count 42}
-{:event :new-mail :path "INBOX" :uids [1001] :messages [{:uid 1001 :seq 43 :envelope {...} :flags #{"\\Seen"}}]} ; only with :fetch? true
-{:event :expunge  :path "INBOX" :uid 998 :seq nil :vanished? true}   ; seq-only when the server has no QRESYNC
+{:event :open     :path "INBOX" :mailbox {:path "INBOX" :exists 42 :uid-next 1001 :uid-validity "17…"}}
+{:event :new-mail :path "INBOX" :count 43 :prev-count 42}           ; every EXISTS whose count changed (was ":exists")
+{:event :new-mail :path "INBOX" :count 43 :prev-count 42 :uids [1001] :messages [{:uid 1001 :seq 43 :envelope {...} :flags #{"\\Seen"}}]} ; with :fetch? true, only when count > prev-count
+{:event :expunge  :path "INBOX" :uid 998 :seq nil :vanished true}    ; seq-only when the server has no QRESYNC
 {:event :flags    :path "INBOX" :uid 1000 :seq 42 :flags #{"\\Seen" "\\Flagged"} :modseq "5"}
-{:event :idle-restart :path "INBOX"}                                 ; each maxIdleTime cycle
+{:event :idle-restart :path "INBOX"}                                 ; each :max-idle-ms cycle (29 min default)
 {:event :error    :error <ex-info :email-cljs/imap-error|:network-error>}
-{:event :close    :path "INBOX" :reason "BYE …" | nil}               ; channel is closed right after
+{:event :closed   :path "INBOX" :reason :stopped|:consumer-closed|:connection-lost|:error} ; last event; channel closed right after
 #+end_src
+As built in phase 3 (=email-cljs.imap/watch!= + =stop-watch!= + =watching?=): the ':exists'
+and ':new-mail' rows above were merged into ONE =:new-mail= event per EXISTS (the brief's
+event list), and ':close' became =:closed= with a keyword reason. The IDLE restart is driven
+by the library, not by imapflow's =maxIdleTime= (which loops *inside* one =idle()= call and
+would make the restart invisible): =maxIdleTime= is passed as =false=, an unref'd timer
+breaks IDLE with a =noop()= every =:max-idle-ms=, =idle()= resolves, the loop emits
+=:idle-restart= and re-enters =idle()= — verified with a fake connection and a 30 ms period.
 Mechanics (all inside =email-cljs.imap-binding=):
 - The watcher owns a *dedicated* =ImapFlow= connection (=:connection= option may pass one, but
   the default is to open a second connection from the same client config): a connection in
@@ -967,11 +984,14 @@ from JSON; =path= would read any file the process can read.
    labels pass bytes through undecoded. Search strings with non-ASCII need UTF-8 CHARSET
    support on the server (imapflow sends CHARSET UTF-8 when needed; Dovecot ok — 13.17).
 4. *Search dates and time zones.* SINCE/BEFORE/ON are date-only, compared against
-   INTERNALDATE in the server's zone; SENTSINCE against the =Date:= header. imapflow formats
-   the JS Date with LOCAL date components. House rule: the library accepts =:since= as an
-   =#inst=, a ="YYYY-MM-DD"= string, or a JS-Date-free ={:year :month :day}=; strings are passed
-   through untouched (imapflow accepts strings) so the caller controls the day; insts are
-   converted with UTC components (documented) — 13.7.
+   INTERNALDATE in the server's zone; SENTSINCE against the =Date:= header. imapflow 2.0.6
+   re-parses every date value (strings too) with =new Date()= and renders it from UTC ISO
+   components (5.4, corrected in phase 3) — so "pass strings verbatim" is NOT possible: a
+   wire-spelled ="DD-Mon-YYYY"= string shifts a day east of UTC. House rule (as built):
+   =imap/search-date= accepts an =#inst= (its UTC calendar day), ="YYYY-MM-DD"=,
+   ="DD-Mon-YYYY"= or ={:year :month :day}=, always hands imapflow the date-only ISO form
+   (which =new Date()= reads as UTC midnight and =formatDate= renders back unchanged, and
+   which keeps BEFORE off the +24 h path), and rejects anything else — 13.7.
 5. *Envelope =Date= vs =internalDate=.* The header date is whatever the sender wrote (can be
    absent, wrong, in any zone; mailparser silently substitutes NOW for unparseable ones —
    the library detects that by re-reading =headerLines= and reports =:date nil=). =internalDate=
@@ -1058,10 +1078,13 @@ Each item names the recommended house position to implement *now* and what the s
    SEARCH command then sends =ALL= (expected) or a malformed command is unverified offline.
    Position: the library rejects an empty query with =:argument-error= unless =:all true= is
    given explicitly, so the case never reaches imapflow.
-7. *Search date rendering / timezone.* imapflow formats Dates with local components (the
-    day-boundary risk described in 12.4). Position: accept strings verbatim, convert insts with UTC
-   components, and document; the smoke sends a message, searches =:since= today (UTC) and
-   yesterday, and checks both find it.
+7. *Search date rendering / timezone.* RESOLVED OFFLINE in phase 3 (the claim "local
+   components" was wrong; strings are re-parsed — 5.4 / 12.4): the library normalises every
+   date form to ="YYYY-MM-DD"= and the test suite proves through imapflow's own
+   =searchCompiler= that =#inst=, ="24-Sep-2026"=, ="2026-09-24"= and ={:year :month :day}=
+   all compile to =SINCE 24-Sep-2026= on this UTC+3 machine. Still for the smoke: the
+   server-side day comparison — send a message, search =:since= today (UTC) and yesterday,
+   and check both find it.
 8. *BODY.PEEK.* imapflow is believed to always fetch with =.PEEK= (no implicit =\Seen=).
    Position: the smoke fetches a fresh message with =:source= and asserts =\Seen= is still
    absent afterwards; if it is set, the library adds ={:peek? true}= handling (read-only open).
@@ -1206,27 +1229,32 @@ Mailbox status (=imap/status!=): ={:path "INBOX" :messages 43 :unseen 1 :uid-nex
 ** 14.4 Namespaces and public functions (phases 2-4)
 | Namespace                   | Phase | Public fns                                                                                       | Interop? |
 |-----------------------------+-------+--------------------------------------------------------------------------------------------------+----------|
-| =email-cljs.util=           | 0     | case translation, =secret= / =secret?= / =reveal= / =clean-secret= / =redact-config= / =parse-secrets-file= / =parse-bool=, =smtp-code-class= / =smtp-retryable?=, error constructors + predicates | no |
-| =email-cljs.core=           | 2     | =client= (config map: =:smtp {:host :port :tls? :auth-method :timeouts :pool :tls}=, =:imap {:host :port :tls? :tls :max-idle-ms :max-literal-bytes :qresync? :client-info}=, =:username= (Secret-free), =:password= (Secret), =:from= default, =:allow-file-access?=, =:allow-url-access?=, =:logger=), =client-from-env= / =client-from-secrets-file= (=BORRET_EMAIL_*= / =EMAIL_*= keys, 13.22), =can-auth?=, =send!= (message map -> promise of send result; =:strict?=, =:save-to-sent=), =verify-smtp!=, =verify-imap!=, =close!= (pool) | no (delegates) |
-| =email-cljs.smtp-binding=   | 2     | =create-transport=, =send-mail=, =verify=, =close=, =transport-events-chan= (idle/clear/error), =build-message-bytes= (MailComposer), =parse-address-list= (addressparser), =nodemailer-error->ex= | YES (all nodemailer interop) |
+| =email-cljs.util=           | 0+2   | case translation, =secret= / =secret?= / =reveal= / =clean-secret= / =redact-config= / =parse-secrets-file= / =parse-bool= / =parse-port=, =smtp-code-class= / =smtp-retryable?=, error constructors + predicates; phase 2 added =parse-address= / =address= / =addresses= / =format-address= / =format-addresses=, =normalize-header-name=, =normalize-message-id=, =deep-merge=, =env-config= (pure) and =from-env= (the one I/O fn, delegating to parse-binding; 13.22) | no (from-env delegates) |
+| =email-cljs.smtp=           | 2 DONE | =smtp-client= (opts: =:host :port :secure :auth {:user :pass} :auth-method :name :tls :pool? :max-connections :max-messages :rate-limit :rate-delta :*-timeout-ms :require-tls? :ignore-tls? :max-recipients :logger? :allow-file-access? :allow-url-access? :defaults :transport=), =smtp-client-from-env=, =config-from-env=, =client-options->wire= (pure), =message->wire= (pure), =error-map->ex= (pure), =send!= (=:strict?=), =verify-smtp!=, =close-smtp!=, =client?=. (The planned =core= namespace was folded into =smtp= / =imap= per the phase-2/3 brief; a shared =core= facade is a phase-4 candidate.) | no |
+| =email-cljs.smtp-binding=   | 2 DONE | =->js= (Secret reveal, Bytes unwrap, keyword names), =create-transport= (options map or an opaque plugin), =send-mail= (info -> kebab map), =verify=, =close=, =idle?=, =transport-name=, =error->map= (NodemailerError fields). =transport-events-chan=, =build-message-bytes= (MailComposer), =parse-address-list= deferred to phase 4 with =message/build=. | YES (all nodemailer interop; js-invoke / unchecked-get style) |
 | =email-cljs.message=        | 2/4   | =build= / =build-string= (11.2), =parse!= (bytes/string -> parsed map), =parse-chan= (streaming), =parse-addresses= / =format-address= / =format-addresses=, =normalize-message-id=, =attachment-of= (find by cid/filename), =inline-attachments= / =file-attachments=, =text-or-html= | no |
-| =email-cljs.parse-binding=  | 4     | =simple-parse=, =mail-parser-chan=, =header-block->map= (mailparser on a header Buffer), =mailparser-error->ex= | YES (mailparser + Buffer/Map) |
-| =email-cljs.attachment=     | 4     | =bytes= (from base64 / vector of ints / string+charset / opaque), =->base64=, =->string=, =size=, =bytes?=, =write-file!= / =read-file!= (promises; the ONLY fs use, gated by =:allow-file-access?= for =:path= sends but always allowed for explicit calls), =chunks->bytes=, =attachment= (constructor with validation: exactly one of =:content= / =:bytes= / =:path= / =:href= / =:raw=), =content-type-of= (extension lookup via nodemailer's mime-funcs — in the binding) | no — the Buffer/fs touches behind =bytes= / =->base64= / =write-file!= live in =email-cljs.parse-binding=, keeping the binding namespaces at three |
-| =email-cljs.imap=           | 3     | =connect!= / =disconnect!= (=logout=), =connection?= / =usable?=, =capabilities= / =enabled=, =list!= / =list-tree!= / =status!= / =quota!=, =create-mailbox!= / =rename-mailbox!= / =delete-mailbox!= / =subscribe!= / =unsubscribe!=, =with-mailbox= (lock, fn -> promise; =:read-only?=), =open!= / =close-mailbox!= / =mailbox= (current), =search!= (DSL 5.4, always UIDs; =:return [:count :max]=), =fetch!= (uids/range + query 5.5, =fetchAll=), =fetch-one!=, =fetch-source!= (Bytes), =fetch-headers!= (parsed), =download!= / =download-chan= / =download-many!= (9.3), =add-flags!= / =remove-flags!= / =set-flags!= / =mark-seen!= / =mark-unseen!= / =flag!= / =unflag!= (=:unchanged-since=, =:silent?=), =set-flag-color!=, =move!= / =copy!= / =delete!= / =expunge!= (=close-mailbox!= semantics documented), =append!=, =watch!= / =stop-watch!= (10.2), =new-uids-since= helper, =find-message-id!= (search by Message-ID, for the smoke), =mailbox-by-special-use= | no |
-| =email-cljs.imap-binding=   | 3     | =make-client=, =connect=, =logout=, =close=, every imapflow method wrapped 1:1 with Map/Set/BigInt/Buffer conversion, =events->chan= (listener plumbing), =idle-loop= (10.2), =imapflow-error->ex=, =range->js= (sequence sets), =search->js= (dates/bigints) | YES (all imapflow interop) |
+| =email-cljs.parse-binding=  | 2 (part) / 4 | phase 2 part: Buffer helpers behind Bytes (=buffer?= =buffer-from-base64= =buffer-from-string= =buffer-from-ints= =buffer->base64= =buffer->string= =buffer->ints= =buffer-length= =buffer-equals?= =buffer-concat= =buffer-slice= =stream->buffer=), =env-map=, =read-file-text=, =file-exists?=, =expand-home=, =set-timer= / =clear-timer= (unref'd, for the watcher), =now-ms=. Phase 4: =simple-parse=, =mail-parser-chan=, =header-block->map=, =mailparser-error->ex= | YES (Buffer / fs / os / process.env / timers) |
+| =email-cljs.attachment=     | 2 (Bytes) / 4 | phase 2 part: the opaque =Bytes= deftype (=bytes= from Bytes / vector of ints / string / opaque Buffer-Uint8Array, =from-base64=, =from-string=, =->base64=, =->string=, =->ints=, =size=, =bytes?=, =concat-bytes=, =slice=, =unwrap= for bindings; prints =#email-cljs/bytes {:size N}=, equal by content). Phase 4: =write-file!= / =read-file!=, =attachment= constructor/validation, =content-type-of= | no (Buffer touches live in parse-binding) |
+| =email-cljs.imap=           | 3 DONE | =imap-client= (opts incl. =:make-conn= factory, =:max-idle-ms=, =:max-literal-size= 256 MB, =:qresync?=), =imap-client-from-env=, =config-from-env=, =client-options->wire= (pure), =connect!= (resolves once usable; records =capabilities=), =close-imap!=, =connected?=, =capabilities=, =last-error=, =mailbox-open!= (lock; =:read-only?=) / =mailbox-close!= (=:expunge?= sends CLOSE) / =current-mailbox=, =mailboxes!= (=:status?= =:special-use-hints=), =mailbox-status!=, =quota!= (bytes), =compile-search= / =search-date= / =range->wire= (pure), =search!= (=:return= ESEARCH), =fetch-query= (pure), =fetch-all!= / =fetch-one!= (=:peek= accepted, always PEEK), =download!= / =body-part!= / =source!= (Bytes), =flag->wire= / =flags->wire= (pure), =flags-set!= / =flags-add!= / =flags-del!= / =mark-seen!= / =mark-unseen!=, =move!= / =copy!= (uid-map), =delete!= (=:strict?=), =expunge!= (bare EXPUNGE via =exec=, path guard), =uid-expunge!= (UID EXPUNGE via =exec=, documented EXPUNGE fallback, =:strict?=), =append!=, =watch!= / =stop-watch!= / =watching?= (10.2), =error-map->ex= (pure). Deferred: =list-tree!=, mailbox create/rename/delete/subscribe wrappers (binding fns exist for create/delete/rename), =with-mailbox=, =set-flag-color!=, =download-chan=, =find-message-id!= (= =(fetch-one! c {:header {"Message-ID" id}})=), =watch-forever!= | no |
+| =email-cljs.imap-binding=   | 3 DONE | =js->data= (Map/Set/BigInt/Buffer/Date/plain-object walker; =parameters= / =disposition-parameters= / =header= keep wire keys), =->js=, =bigint?= =js-date?= =date->iso= =inst->search-date=, =error->map=, =make-client= (attaches the 'error' listener), =connect= =logout= =close= =noop= =usable?= =closed?= =idling?= =capabilities= =enabled= =has-capability?= =current-mailbox= =server-info= =tls-info=, =list-mailboxes= =status= =get-quota= =mailbox-open= =mailbox-close= =get-mailbox-lock= =mailbox-create= =mailbox-delete= =mailbox-rename=, =search= =fetch-all= =fetch-one= =download= (drains the stream) =message-flags-set/add/remove= =message-delete= =message-move= =message-copy= =append= =exec= =idle=, =on= / =off= (payload walked), =compile-search-attributes= (imapflow searchCompiler offline) | YES (all imapflow interop; js-invoke / unchecked-get style) |
 | =email-cljs.dev= / =smoke=  | 0 / 5 | dev runtime; smoke sections (15)                                                                 | smoke only |
 
 ** 14.5 Phase outline
-- Phase 2 (=core= + =smtp-binding= + =message/build=): client config + secrets file, Secret
-  wiring into =auth=, single/pooled transports, =send!= with the 2.5 result and =:strict?=,
-  =verify-smtp!=, =message/build= via MailComposer, address parsing/formatting, security
-  defaults (11.4), error mapping (8.1). Tests: stream/json transports round-trip through
-  mailparser (already installed) — no network.
-- Phase 3 (=imap= + =imap-binding=): connection lifecycle, mailboxes, search DSL, fetch
-  shapes, flags, move/copy/delete/append, download, =watch!= channel (10.2). Tests: a fake
-  ImapFlow object (EventEmitter with scripted method results) injected through
-  =imap-binding/make-client=; the search/fetch translators tested pure; =searchCompiler=
-  invoked offline with a fake connection (as in the probe) to assert wire attributes.
+- Phase 2 (=smtp= + =smtp-binding=, plus the Bytes wrapper in =attachment= and the Buffer /
+  env / fs part of =parse-binding=) — DONE 2026-09-25: client config + secrets file
+  (=util/from-env=), Secret wiring into =auth=, single/pooled transports, =send!= with the
+  2.5 result and =:strict?=, =verify-smtp!=, address normalisation (=util/addresses=),
+  security defaults (11.4), error mapping (8.1). =message/build= (MailComposer without a
+  transport) moved to phase 4 next to =parse!=. Tests: a nodemailer transport *plugin*
+  (=test-util/fake-transport=) that runs the real =Mail= / =MailComposer= normalisation
+  (=mail.normalize()=) and captures the result — no network, no mailparser needed yet.
+- Phase 3 (=imap= + =imap-binding=) — DONE 2026-09-25: connection lifecycle, mailboxes,
+  search DSL (dates corrected, 5.4), fetch shapes, flags, move/copy/delete/expunge/append,
+  download, =watch!= channel (10.2 as built). Tests: a fake ImapFlow object
+  (=test-util/fake-imap=, EventEmitter with scripted method results) injected through
+  =imap-client='s =:make-conn= factory (the watcher gets a second fake from the same
+  factory); the translators tested pure; =searchCompiler= invoked offline with the fake
+  connection to assert wire attributes.
 - Phase 4 (=message/parse!= + =parse-binding= + =attachment=): simpleParser and MailParser
   channel, Bytes wrapper, base64/string views, file helpers, cid/inline logic, charset
   reporting, edge cases (8.3). Tests: canned RFC 822 fixtures (nested multipart, 8-bit
@@ -1323,3 +1351,51 @@ Safety: never loops sends; hard cap 3 messages per run; skips the wrong-password
 ** Protocol references
 RFC 5321, 5322, 2045-2047, 2183, 2231, 2392, 3501, 9051, 2177, 7162, 4315, 2087/9208, 6154,
 5258, 3461, 6531, 8314, 8689, 3516, 4731, 9394, 8474.
+
+* 17. Phase 2+3 implementation notes and inventory corrections (2026-09-25)
+Found while implementing against the installed packages (all offline; every item is covered
+by a test in =test/email_cljs/{smtp,imap,attachment}_test.cljs=):
+1. *Search dates (5.4 / 12.4 / 13.7 corrected).* imapflow 2.0.6 renders dates from UTC ISO
+   components, not local ones, AND re-parses string values with =new Date()=: the settled
+   "date strings pass verbatim" cannot hold (a ="DD-Mon-YYYY"= string is read as local
+   midnight and comes out a day early on this UTC+3 machine). As built: every date form is
+   normalised to ="YYYY-MM-DD"= (=imap/search-date=), which imapflow reads as UTC midnight and
+   renders back unchanged; unknown spellings are rejected before the connection is touched.
+   =#inst= -> UTC calendar day stands.
+2. *HEADER names upper-cased on the wire* — confirmed offline (=HEADER MESSAGE-ID "<..>"=);
+   keyword header names in the DSL are rendered =X-Foo= style before that.
+3. *Bare EXPUNGE / UID EXPUNGE.* imapflow exposes no method for them (=messageDelete= always
+   adds =\\Deleted= first; =mailboxClose= sends CLOSE). The binding runs them through the
+   client's =exec(command, attributes)= (public on the JS object, undeclared in the =.d.ts=);
+   =uid-expunge!= sends ={type: "SEQUENCE"}= attributes exactly as =commands/expunge.js= does.
+   4.3 table: add =exec= (scope: binding-internal).
+4. *=maxIdleTime= loops inside one =idle()= call* (=commands/idle.js=; 4.5 was right), so an
+   imapflow-driven restart is invisible to the caller. The watcher passes =maxIdleTime: false=
+   and restarts itself (NOOP breaks IDLE; =idle()= resolves; =:idle-restart= emitted; IDLE
+   re-entered). =idle()= also short-circuits (returns undefined) when =idling= is already true.
+5. *nodemailer =normalize()= keeps string =content= as-is* (only Buffers are base64'd and get
+   =encoding: "base64"=), so a Bytes attachment reaches the transport as
+   ={content: "<base64>", encoding: "base64"}= while a string stays a string. 2.6's description
+   of the json transport output is consistent with this.
+6. *=Mail.verify()= / =close()= on a plugin transport* simply forward to the plugin (returning
+   =false= with a logger warning when the plugin lacks the method); the library's
+   =verify-smtp!= therefore resolves =true= for transports without =verify= (json / stream).
+7. *=process.env= is not =js->clj=-able* (exotic object): =parse-binding/env-map= walks
+   =Object.keys= explicitly.
+8. *Mailbox open options.* imapflow's option key is =readOnly= (camelCase) — the first cut sent
+   =read-only= and the fake-connection test caught it; the translators now spell wire keys
+   explicitly instead of relying on the generic option camelisation for one-off maps.
+9. *House namespaces (14.4 updated).* The brief named =smtp= / =imap= as the public
+   namespaces; the inventory's planned =core= facade was folded into them
+   (=smtp-client-from-env= / =imap-client-from-env= replace =core/client-from-env=). The Bytes
+   wrapper had to land in phase 2 (attachments in, downloads out), so =attachment= (wrapper
+   only) and the Buffer/env/fs part of =parse-binding= exist now; mailparser arrives in phase 4.
+10. *=util/from-env= is the one I/O function in =util=* (process.env + secrets-file read via
+    =parse-binding=); =util/env-config= is the pure part and is what the tests exercise.
+    Precedence: environment over the secrets file, file from =:secrets-file= /
+    =EMAIL_SECRETS_FILE= / =~/.secrets/borret.txt=; prefix configurable (13.22).
+11. *Watcher event names (10.2 updated):* =:new-mail= (one per EXISTS; =:messages= only with
+    =:fetch? true= and only for count > prev-count), =:closed= (keyword reasons), plus =:open=
+    =:expunge= =:flags= =:idle-restart= =:error= as planned.
+12. *:peek.* Accepted on fetch opts and ignored: imapflow always uses =BODY.PEEK= (13.8 still
+    to be confirmed live; nothing in the library can set =\\Seen= implicitly).

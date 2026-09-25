@@ -5,13 +5,23 @@
    account password; secrets-file parsing; SMTP reply-code classification;
    ex-info error construction and detection.
 
-   Pure: no I/O and no JavaScript interop. Converting CLJS maps to JS option
-   objects, reading `code`/`response`/`responseCode` off a thrown JS error and
-   touching Buffers/streams is interop and therefore lives in the binding
-   namespaces (email-cljs.smtp-binding, email-cljs.imap-binding,
-   email-cljs.parse-binding — Phase 2+); this namespace only deals in
-   strings, keywords and maps (docs/email-api-inventory.org section 9)."
-  (:require [clojure.string :as str]))
+   Pure: no I/O and no JavaScript interop, with ONE documented exception —
+   from-env, which delegates its two I/O touches (process.env and the
+   secrets-file read) to email-cljs.parse-binding and is otherwise the pure
+   env-config. Converting CLJS maps to JS option objects, reading
+   `code`/`response`/`responseCode` off a thrown JS error and touching
+   Buffers/streams is interop and therefore lives in the binding namespaces
+   (email-cljs.smtp-binding, email-cljs.imap-binding,
+   email-cljs.parse-binding); this namespace only deals in strings, keywords
+   and maps (docs/email-api-inventory.org section 9).
+
+   Also here (Phase 2): the address helpers every message-building path
+   uses (address, addresses, format-address, parse-address), header-name
+   normalisation, Message-ID bracket normalisation and the env/secrets-file
+   configuration reader shared by smtp-client-from-env and
+   imap-client-from-env."
+  (:require [clojure.string :as str]
+            [email-cljs.parse-binding :as pb]))
 
 ;; ---------------------------------------------------------------------------
 ;; kebab-case <-> camelCase (inventory 9.2: nodemailer / imapflow / mailparser
@@ -284,3 +294,182 @@
   "True when the error carries :retryable? true (transient SMTP code,
    timeout, connection reset)."
   [e] (boolean (:retryable? (error-data e))))
+
+
+;; ---------------------------------------------------------------------------
+;; Addresses (inventory 1.4, 3.1, 12.1): ONE kebab shape {:name .. :address ..}
+;; ---------------------------------------------------------------------------
+
+(defn- valid-address-string?
+  [s]
+  (and (string? s) (not (str/blank? s))
+       (not (re-find #"[\r\n]" s))))
+
+(defn parse-address
+  "Parses ONE mailbox string — \"a@b.c\", \"Name <a@b.c>\", \"\\\"Doe, John\\\" <a@b.c>\",
+   \"<a@b.c>\" — into {:name .. :address ..} (:name nil when absent). Not a full
+   RFC 5322 parser (no groups, no comments, no encoded-words): address
+   lists and exotic forms go through nodemailer's addressparser in the
+   binding. Returns nil when the string does not look like a mailbox."
+  [s]
+  (when (valid-address-string? s)
+    (let [s (str/trim s)]
+      (if-let [[_ nm addr] (re-matches #"^(.*?)\s*<([^<>\s]+@[^<>\s]+)>$" s)]
+        (let [nm (str/trim nm)
+              nm (if (and (>= (count nm) 2) (str/starts-with? nm "\"") (str/ends-with? nm "\""))
+                   (str/replace (subs nm 1 (dec (count nm))) #"\\(.)" "$1")
+                   nm)]
+          {:name (when-not (str/blank? nm) nm) :address addr})
+        (when (re-matches #"^[^<>\s,]+@[^<>\s,]+$" s)
+          {:name nil :address s})))))
+
+(defn address
+  "Normalises one address given as a string or a {:name :address} map into
+   the {:name .. :address ..} map nodemailer and imapflow both understand.
+   Strings that parse-address cannot read are kept verbatim as
+   {:raw \"...\"} — nodemailer's own parser handles lists and groups — so
+   nothing is silently dropped. Throws :email-cljs/argument-error for
+   anything else (nil, numbers, maps without :address)."
+  [x]
+  (cond
+    (map? x) (if (valid-address-string? (:address x))
+               {:name (let [n (:name x)] (when-not (str/blank? (str n)) (str n)))
+                :address (str/trim (:address x))}
+               (throw (argument-error "address map needs a non-blank :address"
+                                      {:reason :bad-address :value x})))
+    (string? x) (or (parse-address x)
+                    (if (valid-address-string? x)
+                      {:raw (str/trim x)}
+                      (throw (argument-error "blank or multi-line address string"
+                                             {:reason :bad-address :value x}))))
+    :else (throw (argument-error "address must be a string or a {:name :address} map"
+                                 {:reason :bad-address :value x}))))
+
+(defn addresses
+  "Normalises an address field — one address (string or map) or a
+   sequential collection of them — into a vector of address maps (see
+   address). nil -> []."
+  [x]
+  (cond
+    (nil? x) []
+    (sequential? x) (into [] (map address) x)
+    :else [(address x)]))
+
+(defn- quote-display-name
+  [nm]
+  (if (re-find #"[()<>\[\]:;@\\,.\"]" nm)
+    (str "\"" (str/replace nm #"[\"\\]" (fn [m] (str "\\" m))) "\"")
+    nm))
+
+(defn format-address
+  "Renders an address map (or string) as an RFC 5322 mailbox string:
+   \"Name <a@b.c>\" with the display name quoted when it contains specials
+   (a comma in particular, inventory 12.1), or just \"a@b.c\"."
+  [x]
+  (let [{nm :name addr :address raw :raw} (address x)]
+    (cond
+      raw raw
+      (str/blank? (str nm)) addr
+      :else (str (quote-display-name nm) " <" addr ">"))))
+
+(defn format-addresses
+  "Comma-separated rendering of an address field (see addresses)."
+  [x]
+  (str/join ", " (map format-address (addresses x))))
+
+;; ---------------------------------------------------------------------------
+;; Headers and Message-IDs
+;; ---------------------------------------------------------------------------
+
+(defn normalize-header-name
+  "\"x-custom-header\" / :x-custom-header -> \"X-Custom-Header\" (the form
+   nodemailer writes; known acronyms are left to nodemailer's own table)."
+  [k]
+  (->> (str/split (name k) #"-")
+       (map (fn [w] (if (seq w) (str (str/upper-case (subs w 0 1)) (str/lower-case (subs w 1))) w)))
+       (str/join "-")))
+
+(defn normalize-message-id
+  "Ensures a Message-ID carries its angle brackets: \"abc@x\" -> \"<abc@x>\";
+   nil / blank -> nil."
+  [id]
+  (when (and (string? id) (not (str/blank? id)))
+    (let [id (str/trim id)]
+      (str (when-not (str/starts-with? id "<") "<")
+           id
+           (when-not (str/ends-with? id ">") ">")))))
+
+(defn deep-merge
+  "Recursively merges maps (right wins; nested maps merged, anything else
+   replaced). nil arguments are skipped."
+  [& ms]
+  (reduce (fn [a b]
+            (cond
+              (nil? b) a
+              (and (map? a) (map? b)) (merge-with deep-merge a b)
+              :else b))
+          nil
+          ms))
+
+;; ---------------------------------------------------------------------------
+;; Environment / secrets-file configuration (inventory 13.22; 13.5 for TLS_CA)
+;; ---------------------------------------------------------------------------
+
+(def default-env-prefix
+  "Prefix used when none is given: EMAIL_USERNAME, EMAIL_SMTP_HOST ..."
+  "EMAIL_")
+
+(def default-secrets-file
+  "The house secrets file, read when EMAIL_SECRETS_FILE is unset."
+  "~/.secrets/borret.txt")
+
+(defn- normalize-prefix
+  [prefix]
+  (let [p (str (or prefix default-env-prefix))]
+    (if (or (str/blank? p) (str/ends-with? p "_")) p (str p "_"))))
+
+(defn parse-port
+  "Port from a string/number: 1..65535 or nil."
+  [v]
+  (let [n (cond (number? v) v
+                (string? v) (when (re-matches #"^\d{1,5}$" (str/trim v)) (js/parseInt v 10))
+                :else nil)]
+    (when (and n (integer? n) (<= 1 n 65535)) n)))
+
+(defn env-config
+  "Pure: builds the library's configuration from a {\"NAME\" value} map (the
+   environment, a parsed secrets file, or their merge) under a key prefix
+   (\"BORRET_EMAIL_\"; a missing trailing underscore is added). Keys read:
+   <P>USERNAME <P>PASSWORD <P>SMTP_HOST <P>SMTP_PORT <P>SMTP_TLS <P>IMAP_HOST
+   <P>IMAP_PORT <P>IMAP_TLS <P>TLS_CA (PEM chain when the server's chain is
+   private — never a switch that disables validation). Result (absent keys
+   omitted): {:username <Secret> :password <Secret>
+   :smtp {:host :port :secure} :imap {:host :port :secure} :tls {:ca <Secret>}}.
+   TLS values go through parse-bool; ports through parse-port."
+  [vars prefix]
+  (let [pfx (normalize-prefix prefix)
+        g (fn [k] (let [v (get vars (str pfx k))]
+                    (when-not (str/blank? (str v)) (str v))))
+        prune (fn [m] (not-empty (into {} (remove (comp nil? val)) m)))]
+    (prune
+     {:username (secret (g "USERNAME"))
+      :password (secret (g "PASSWORD"))
+      :smtp (prune {:host (g "SMTP_HOST") :port (parse-port (g "SMTP_PORT")) :secure (parse-bool (g "SMTP_TLS"))})
+      :imap (prune {:host (g "IMAP_HOST") :port (parse-port (g "IMAP_PORT")) :secure (parse-bool (g "IMAP_TLS"))})
+      :tls (prune {:ca (secret (g "TLS_CA"))})})))
+
+(defn from-env
+  "Reads the configuration (see env-config) for `prefix` from the process
+   environment merged over the secrets file: `file` (path, `~` allowed), or
+   when nil the EMAIL_SECRETS_FILE variable, or ~/.secrets/borret.txt. A
+   missing/unreadable file is not an error (the environment alone may be
+   complete); the caller (smtp-client-from-env / imap-client-from-env)
+   raises :email-cljs/config-error when what it needs is absent. Values are
+   never printed: passwords and the CA come back as Secrets. The only I/O in
+   this namespace; delegated to email-cljs.parse-binding."
+  ([prefix] (from-env nil prefix))
+  ([file prefix]
+   (let [env (pb/env-map)
+         file (or file (get env "EMAIL_SECRETS_FILE") default-secrets-file)
+         from-file (parse-secrets-file (or (pb/read-file-text file) ""))]
+     (or (env-config (merge from-file env) prefix) {}))))
