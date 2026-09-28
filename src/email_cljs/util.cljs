@@ -13,9 +13,9 @@
    Buffers/streams is interop and therefore lives in the binding namespaces
    (email-cljs.smtp-binding, email-cljs.imap-binding,
    email-cljs.parse-binding); this namespace only deals in strings, keywords
-   and maps (docs/email-api-inventory.org section 9).
+   and maps.
 
-   Also here (Phase 2): the address helpers every message-building path
+   Also here: the address helpers every message-building path
    uses (address, addresses, format-address, parse-address), header-name
    normalisation, Message-ID bracket normalisation and the env/secrets-file
    configuration reader shared by smtp-client-from-env and
@@ -24,7 +24,7 @@
             [email-cljs.parse-binding :as pb]))
 
 ;; ---------------------------------------------------------------------------
-;; kebab-case <-> camelCase (inventory 9.2: nodemailer / imapflow / mailparser
+;; kebab-case <-> camelCase (nodemailer / imapflow / mailparser
 ;; are one camelCase dialect: contentType, bodyStructure, internalDate ...)
 ;; ---------------------------------------------------------------------------
 
@@ -72,7 +72,7 @@
 
 (def option-passthrough-keys
   "Kebab keys whose subtree is handed to the wrapped package verbatim: user
-   data and opaque upstream values (inventory 9.2)."
+   data and opaque upstream values."
   #{:headers :content :raw :header :tls :auth :dkim :envelope :secret :params})
 
 (defn ->camel-keys
@@ -93,7 +93,7 @@
   ([passthrough x] (transform-keys camel->kebab passthrough x)))
 
 ;; ---------------------------------------------------------------------------
-;; Opaque secret (the account password; inventory 1.4)
+;; Opaque secret (the account password)
 ;; ---------------------------------------------------------------------------
 
 (defprotocol ISecret
@@ -185,7 +185,7 @@
     :else nil))
 
 ;; ---------------------------------------------------------------------------
-;; SMTP reply codes (inventory 3.2)
+;; SMTP reply codes
 ;; ---------------------------------------------------------------------------
 
 (defn smtp-code-class
@@ -207,7 +207,7 @@
   (= :transient (smtp-code-class code)))
 
 ;; ---------------------------------------------------------------------------
-;; Errors (inventory section 6)
+;; Errors
 ;; ---------------------------------------------------------------------------
 
 (def error-types
@@ -297,7 +297,7 @@
 
 
 ;; ---------------------------------------------------------------------------
-;; Addresses (inventory 1.4, 3.1, 12.1): ONE kebab shape {:name .. :address ..}
+;; Addresses: ONE kebab shape {:name .. :address ..}
 ;; ---------------------------------------------------------------------------
 
 (defn- valid-address-string?
@@ -364,7 +364,7 @@
 (defn format-address
   "Renders an address map (or string) as an RFC 5322 mailbox string:
    \"Name <a@b.c>\" with the display name quoted when it contains specials
-   (a comma in particular, inventory 12.1), or just \"a@b.c\"."
+   (a comma in particular), or just \"a@b.c\"."
   [x]
   (let [{nm :name addr :address raw :raw} (address x)]
     (cond
@@ -412,7 +412,7 @@
           ms))
 
 ;; ---------------------------------------------------------------------------
-;; Environment / secrets-file configuration (inventory 13.22; 13.5 for TLS_CA)
+;; Environment / secrets-file configuration (13.5 for TLS_CA)
 ;; ---------------------------------------------------------------------------
 
 (def default-env-prefix
@@ -420,8 +420,9 @@
   "EMAIL_")
 
 (def default-secrets-file
-  "The house secrets file, read when EMAIL_SECRETS_FILE is unset."
-  "~/.secrets/borret.txt")
+  "nil: no secrets file is read unless the caller names one (:secrets-file,
+   or the EMAIL_SECRETS_FILE variable)."
+  nil)
 
 (defn- normalize-prefix
   [prefix]
@@ -439,7 +440,7 @@
 (defn env-config
   "Pure: builds the library's configuration from a {\"NAME\" value} map (the
    environment, a parsed secrets file, or their merge) under a key prefix
-   (\"BORRET_EMAIL_\"; a missing trailing underscore is added). Keys read:
+   (\"WORK_EMAIL_\"; a missing trailing underscore is added). Keys read:
    <P>USERNAME <P>PASSWORD <P>SMTP_HOST <P>SMTP_PORT <P>SMTP_TLS <P>IMAP_HOST
    <P>IMAP_PORT <P>IMAP_TLS <P>TLS_CA (PEM chain when the server's chain is
    private — never a switch that disables validation). Result (absent keys
@@ -461,15 +462,16 @@
 (defn from-env
   "Reads the configuration (see env-config) for `prefix` from the process
    environment merged over the secrets file: `file` (path, `~` allowed), or
-   when nil the EMAIL_SECRETS_FILE variable, or ~/.secrets/borret.txt. A
-   missing/unreadable file is not an error (the environment alone may be
-   complete); the caller (smtp-client-from-env / imap-client-from-env)
-   raises :email-cljs/config-error when what it needs is absent. Values are
+   when nil the file named by the EMAIL_SECRETS_FILE variable. No file is
+   read unless one is named, and a missing/unreadable file is not an error
+   (the environment alone may be complete); the caller
+   (smtp-client-from-env / imap-client-from-env) raises
+   :email-cljs/config-error when what it needs is absent. Values are
    never printed: passwords and the CA come back as Secrets. The only I/O in
    this namespace; delegated to email-cljs.parse-binding."
   ([prefix] (from-env nil prefix))
   ([file prefix]
    (let [env (pb/env-map)
          file (or file (get env "EMAIL_SECRETS_FILE") default-secrets-file)
-         from-file (parse-secrets-file (or (pb/read-file-text file) ""))]
+         from-file (parse-secrets-file (or (some-> file pb/read-file-text) ""))]
      (or (env-config (merge from-file env) prefix) {}))))

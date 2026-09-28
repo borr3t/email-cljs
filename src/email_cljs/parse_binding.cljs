@@ -2,10 +2,9 @@
   "Binding namespace (JavaScript interop lives here): the Node Buffer, fs,
    os and process.env touches the rest of the library needs — the carrier
    behind the opaque Bytes wrapper (email-cljs.attachment), the secrets-file
-   read and the environment map behind util/from-env, and (Phase 4) the
-   mailparser call behind email-cljs.message/parse-message! (inventory
-   14.4 keeps the binding namespaces at three: smtp-binding, imap-binding,
-   parse-binding).
+   read and the environment map behind util/from-env, and the mailparser
+   call behind email-cljs.message/parse-message! (the binding namespaces
+   are three: smtp-binding, imap-binding, parse-binding).
 
    Everything exported takes and returns CLJS data or an opaque Buffer /
    stream handle that callers never touch; no other namespace outside the
@@ -62,7 +61,7 @@
 
 (defn buffer->string
   "Decodes the Buffer as text; `encoding` as for buffer-from-string
-   (iconv charsets are Phase 4)."
+   (the encodings Node decodes natively)."
   [b encoding]
   (js-invoke b "toString" (or encoding "utf8")))
 
@@ -171,7 +170,7 @@
   "Parses a date string the way JavaScript does (RFC 5322 date-times
    included) and returns its ISO-8601 UTC form, or nil when it does not
    parse. Used to tell a real Date: header from mailparser's 'now'
-   substitute (inventory 12.5)."
+   substitute."
   [s]
   (when (string? s)
     (let [t (js/Date.parse s)]

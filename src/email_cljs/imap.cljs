@@ -8,13 +8,13 @@
    translates data (compile-search, fetch-query, flag->wire, range->wire,
    error-map->ex are pure and unit-tested offline) and sequences calls.
 
-   Connection model (inventory 10): every connection the library opens has
+   Connection model: every connection the library opens has
    disableAutoIdle true. The main connection (imap-client + connect!) runs
    commands; watch! opens a SECOND connection from the same config, selects
    the mailbox read-only and drives an explicit idle() loop, so command
    traffic and push notifications never share a socket. Errors are
    :email-cljs/imap-error (NO/BAD with the server text), :auth-error,
-   :network-error (timeouts, TLS, closed) or :argument-error (inventory 8.2)."
+   :network-error (timeouts, TLS, closed) or :argument-error."
   (:require [clojure.core.async :as async]
             [clojure.string :as str]
             [email-cljs.attachment :as att]
@@ -28,17 +28,16 @@
 ;; ---------------------------------------------------------------------------
 
 (def default-port
-  "993, implicit TLS (inventory 3.3)."
+  "993, implicit TLS."
   993)
 
 (def default-max-literal-size
-  "256 MB cap on a single IMAP literal (imapflow's own default is 1 GB;
-   inventory 13.14)."
-  268435456)
+  "256 MB cap on a single IMAP literal (imapflow's own default is 1 GB)."
+  (* 256 1024 1024))
 
 (def default-max-idle-ms
   "The watcher re-issues IDLE every 29 minutes (RFC 2177 asks for at most
-   30; inventory 13.10 — NATed clients may want 5 minutes)."
+   30; NATed clients may want 5 minutes)."
   (* 29 60 1000))
 
 (def client-option-keys
@@ -144,8 +143,8 @@
    :make-conn (fn [wire-options on-error] conn) — connection factory,
    default imap-binding/make-client; tests inject fakes here and watch!
    uses it for its own connection.
-   disableAutoIdle is always true (inventory 10.1). Does not connect —
-   see connect!. Throws :email-cljs/config-error."
+   disableAutoIdle is always true. Does not connect — see connect!.
+   Throws :email-cljs/config-error."
   [opts]
   (let [opts (or opts {})
         wire (client-options->wire (dissoc opts :max-idle-ms :make-conn :secrets-file))
@@ -185,15 +184,16 @@
 (defn imap-client-from-env
   "imap-client configured from <prefix>USERNAME / PASSWORD / IMAP_HOST /
    IMAP_PORT / IMAP_TLS / TLS_CA via util/from-env (environment over the
-   secrets file named by :secrets-file in `opts`, EMAIL_SECRETS_FILE, or
-   ~/.secrets/borret.txt). `opts` merge over the environment values."
+   secrets file named by :secrets-file in `opts` or by EMAIL_SECRETS_FILE;
+   no file is read unless one is named). `opts` merge over the environment
+   values."
   ([prefix] (imap-client-from-env prefix nil))
   ([prefix opts]
    (let [env (util/from-env (:secrets-file opts) prefix)]
      (imap-client (util/deep-merge (config-from-env env) (dissoc opts :secrets-file))))))
 
 ;; ---------------------------------------------------------------------------
-;; Error classification (pure; inventory 8.2)
+;; Error classification (pure)
 ;; ---------------------------------------------------------------------------
 
 (def ^:private timeout-codes #{"CONNECT_TIMEOUT" "GREETING_TIMEOUT" "ETIMEOUT" "EConnectionClosed"})
@@ -204,7 +204,7 @@
 
 (defn error-map->ex
   "Pure: an ImapFlowError read into a map by imap-binding/error->map ->
-   the house ex-info. authenticationFailed -> :auth-error :imap;
+   the library's ex-info. authenticationFailed -> :auth-error :imap;
    tlsFailed / UPGRADE_TIMEOUT / STARTTLS_INJECTION -> :network-error
    :tls? true; CONNECT_TIMEOUT GREETING_TIMEOUT ETIMEOUT EConnectionClosed
    or a BYE reason -> :network-error retryable; NoConnection ->
@@ -313,7 +313,7 @@
   "The last warn / error entry imapflow logged for this connection
    ({:level :warn :message :response-status :response-text :command ..}
    — the fields of the error it wrapped) or nil. imapflow logs, instead
-   of throwing, the NO / BAD reply to a SEARCH (inventory 18.2); search!
+   of throwing, the NO / BAD reply to a SEARCH; search!
    reads this to explain a refused search."
   [client]
   (:last-warning @(:state client)))
@@ -378,7 +378,7 @@
 (defn mailbox-close!
   "Releases the mailbox lock taken by mailbox-open!. With {:expunge? true}
    also sends CLOSE, which permanently removes every \\Deleted message of a
-   read-write mailbox (RFC 3501 6.4.2; inventory 12.7) — off by default.
+   read-write mailbox (RFC 3501 6.4.2) — off by default.
    Promise of true."
   ([client] (mailbox-close! client nil))
   ([client {:keys [expunge?]}]
@@ -453,21 +453,20 @@
 (defn tls-info
   "TLS facts of the connection after connect!: {:authorized bool
    :authorization-error .. :cipher .. :version ..} (nil when cleartext).
-   :authorized is what to check when trusting a private chain via :ca
-   (inventory 13.5)."
+   :authorized is what to check when trusting a private chain via :ca."
   [client]
   (ib/tls-info (:conn client)))
 
 (defn quota!
   "GETQUOTAROOT -> promise of {:path :storage {:used :limit} (BYTES —
-   imapflow converts the KiB wire unit; inventory 13.12) :messages {:used
+   imapflow converts the KiB wire unit) :messages {:used
    :limit}} or nil when the server has no QUOTA / the path is unknown."
   ([client] (quota! client nil))
   ([client mailbox]
    (run (fn [] (ib/get-quota (:conn client) mailbox)))))
 
 ;; ---------------------------------------------------------------------------
-;; Search DSL (pure; inventory 5.4)
+;; Search DSL (pure)
 ;; ---------------------------------------------------------------------------
 
 (def ^:private flag-search-keys
@@ -581,12 +580,12 @@
    :gmraw (strings); :larger :smaller (bytes); :before :on :since
    :sent-before :sent-on :sent-since (\"YYYY-MM-DD\", \"DD-Mon-YYYY\", an
    #inst taken as its UTC calendar day, or {:year :month :day} — all
-   normalised by search-date, see there for why; inventory 12.4 / 13.7);
+   normalised by search-date, see there for why);
    :header {\"Message-ID\" \"<..>\" :x-foo true} (keyword names rendered
    as X-Foo; imapflow upper-cases them on the wire);
    :modseq; :not {..}; :or [{..} {..}]. Every key is ANDed. An empty query
    (no keys, or only nil values) is rejected with :email-cljs/argument-error
-   :reason :empty-search unless {:all true} is explicit (inventory 13.6)."
+   :reason :empty-search unless {:all true} is explicit."
   [query]
   (let [compiled (compile-search* query)]
     (when (empty? compiled)
@@ -610,7 +609,7 @@
                                       {:reason :bad-range :value range}))))
 
 (defn adjust-search-for-within
-  "Pure: the WITHIN guard (inventory 18.1). On a server advertising WITHIN
+  "Pure: the WITHIN guard. On a server advertising WITHIN
    (RFC 5032; Dovecot does) imapflow 2.0.6 sends :since / :before as
    YOUNGER / OLDER <seconds between now and the date's UTC midnight>
    instead of SINCE / BEFORE <day> — absolute-time semantics with exact
@@ -690,7 +689,7 @@
    block) or :headers [\"Subject\" ..] (only those); :source? true (whole
    RFC 822 as Bytes) or :source {:start :max-length}; :body-parts [\"1\"
    \"2.1\"]; :peek is accepted and ignored — imapflow always fetches with
-   BODY.PEEK so nothing here sets \\Seen (inventory 13.8); :changed-since
+   BODY.PEEK so nothing here sets \\Seen; :changed-since
    (modseq) rides in the options, not the query. uid is always requested."
   [opts]
   (let [opts (or opts default-fetch-opts)]
@@ -754,7 +753,7 @@
    :envelope {:date :subject :message-id :in-reply-to :from [{:name :address}]
    :to .. :cc .. :bcc ..} :body-structure {:type :parameters {..} :part
    :child-nodes [..] ..} :source Bytes :headers Bytes}. Drained with
-   fetchAll (no generator deadlocks; inventory 12.16): keep ranges bounded."
+   fetchAll (no generator deadlocks): keep ranges bounded."
   ([client range] (fetch-all! client range nil))
   ([client range opts]
    (run (fn []
@@ -776,7 +775,7 @@
 
 (defn download!
   "Downloads one body part (IMAP part number from :body-structure, e.g.
-   \"1.2\" or \"2\"; mailparser's part-id agrees — inventory 5.6) of the
+   \"1.2\" or \"2\"; mailparser's part-id agrees) of the
    message with `uid`, decoded (transfer encoding removed, text converted
    to UTF-8). `part-id` nil downloads the whole RFC 822 source. Options:
    {:max-bytes n}. Promise of {:meta {:content-type :charset :disposition
@@ -838,7 +837,7 @@
    :draft or custom keyword strings. Options {:unchanged-since modseq
    :silent? true}. Promise of boolean (false when the server refused or
    dropped everything — imapflow silently drops flags the mailbox's
-   permanent-flags do not allow, inventory 12.17)."
+   permanent-flags do not allow)."
   ([client range flags] (flags-set! client range flags nil))
   ([client range flags opts]
    (run (fn [] (ib/message-flags-set (:conn client) (range->wire range) (flags->wire flags) (store-options opts))))))
@@ -891,7 +890,7 @@
   "Marks `range` \\Deleted and expunges it: UID EXPUNGE <range> when the
    server has UIDPLUS (only those messages go); otherwise imapflow falls
    back to a plain EXPUNGE, which ALSO removes every other message any
-   client marked \\Deleted in this mailbox (inventory 5.7 / 13.11).
+   client marked \\Deleted in this mailbox.
    {:strict? true} rejects with :argument-error :missing-server-extension
    instead of falling back. Promise of true; rejects :imap-error
    :reason :command-failed when the server refused."
@@ -958,7 +957,7 @@
             (or r (throw (util/imap-error "append failed" {:reason :command-failed :command "APPEND" :path mailbox}))))))))
 
 ;; ---------------------------------------------------------------------------
-;; watch! — the IDLE watcher (inventory 10.2)
+;; watch! — the IDLE watcher
 ;; ---------------------------------------------------------------------------
 
 (defonce ^:private watchers
@@ -1044,14 +1043,14 @@
         (fetched with :query, default default-fetch-opts) — only new mail
         (count > prev-count) is fetched
      {:event :expunge :path .. :uid n :seq nil :vanished true} (:uid only
-        with QRESYNC; otherwise :seq — inventory 10.3)
+        with QRESYNC; otherwise :seq)
      {:event :flags :path .. :uid n :seq n :flags #{..} :modseq \"..\"}
      {:event :idle-restart :path ..}   every :max-idle-ms (29 min default)
         the loop breaks IDLE with a NOOP and re-enters it (RFC 2177)
      {:event :error :error <ex-info>}
      {:event :closed :path .. :reason :stopped|:consumer-closed|
         :connection-lost|:error|\"BYE ..\"}  last event; the channel is closed
-        right after. The watcher never reconnects (inventory 13.16).
+        right after. The watcher never reconnects.
    Options: :buffer n (sliding buffer, default 64; the newest events win
    under back-pressure) or :buffer :block (unbuffered — the loop's put!
    waits on the consumer); :fetch? false; :query fetch opts; :max-idle-ms;

@@ -8,12 +8,12 @@
    Interop-free: mailparser is called by email-cljs.parse-binding
    (simple-parse, which returns raw CLJS data with opaque Buffers), the
    composer by email-cljs.smtp-binding (compose); this namespace only
-   normalises data. The parsed shape (inventory 14.3, as built):
+   normalises data. The parsed shape:
 
      {:subject \"..\" :text \"..\" :html \"..\" :text-as-html \"..\"
       :from {:name .. :address ..} :from-all [..] :sender {..}|nil
       :reply-to [..] :to [..] :cc [..] :bcc [..]            ; [{:name :address}] (:group on members)
-      :date \"2026-09-24T23:08:56.000Z\"|nil :date-raw \"Thu, 24 Sep ..\"|nil
+      :date \"1997-11-21T15:55:06.000Z\"|nil :date-raw \"Fri, 21 Nov ..\"|nil
       :message-id \"<..>\"|nil :in-reply-to \"<..>\"|nil :references [\"<..>\" ..]
       :priority :high|:normal|:low
       :headers {\"Content-Type\" {:value .. :params {..}} \"X-Custom-Header\" \"v1\" ..}
@@ -22,17 +22,17 @@
                      :cid :content-id :related? :inline? :part-id :size :checksum
                      :checksum-algo :content <Bytes> :headers {..}} ..]}
 
-   Header names are canonical-cased (\"Message-ID\", \"X-Custom-Header\",
-   inventory 14.1 passthrough rule; `header` looks them up
-   case-insensitively). Address header values are vectors of
-   {:name :address}; groups are flattened into their members with :group.
+   Header names are canonical-cased (\"Message-ID\", \"X-Custom-Header\";
+   `header` looks them up case-insensitively). Address header values are
+   vectors of {:name :address}; groups are flattened into their members
+   with :group.
    Attachment content is a Bytes wrapper (email-cljs.attachment) — base64
-   on demand via attachment->base64, never eagerly (inventory 9.3).
+   on demand via attachment->base64, never eagerly.
 
-   Streaming parse (mailparser's MailParser stream class, inventory 6.4)
-   is NOT exposed: it needs a Node Readable as input, which no interop-free
-   caller can produce, and imap/download! already drains parts to Bytes
-   with a :max-bytes cap. parse-message! takes a string or Bytes."
+   Streaming parse (mailparser's MailParser stream class) is NOT exposed:
+   it needs a Node Readable as input, which no interop-free caller can
+   produce, and imap/download! already drains parts to Bytes with a
+   :max-bytes cap. parse-message! takes a string or Bytes."
   (:require [clojure.string :as str]
             [email-cljs.attachment :as att]
             [email-cljs.parse-binding :as pb]
@@ -157,11 +157,11 @@
      :headers (normalize-headers (:headers a))}))
 
 (defn normalize-parsed
-  "Pure: the raw simple-parse data (inventory 6.1 shapes with kebab keys)
+  "Pure: the raw simple-parse data (mailparser's shapes with kebab keys)
    -> the library's parsed-message map (see the namespace docstring).
    `checksum-algo` names the digest mailparser used. A Date: header that
    did not parse is reported as :date nil + :date-raw (mailparser itself
-   substitutes 'now', inventory 12.5)."
+   substitutes 'now')."
   [raw checksum-algo]
   (let [lines (header-lines (:header-lines raw))
         headers (normalize-headers (:headers raw))
@@ -170,7 +170,7 @@
         from (address-field (:from raw))
         references (:references raw)
         ;; mailparser folds X-Priority / X-MSMail-Priority / Importance / Priority
-        ;; into ONE headers entry named "priority" (inventory 6.3) and never
+        ;; into ONE headers entry named "priority" and never
         ;; copies it to the top level (6.1 was wrong about that)
         priority (or (:priority raw) (get (:headers raw) "priority"))]
     {:subject (:subject raw)
@@ -207,9 +207,8 @@
 (defn parse-options->wire
   "Pure: kebab parse options -> the string-keyed camelCase mailparser
    option map. Defaults: keepCidLinks true (html keeps its cid: links and
-   the attachment carries :cid — the caller decides whether to inline,
-   inventory 7.3 / 12.8), checksumAlgo md5. Throws :argument-error for
-   unknown keys."
+   the attachment carries :cid — the caller decides whether to inline),
+   checksumAlgo md5. Throws :argument-error for unknown keys."
   [opts]
   (let [opts (or opts {})
         unknown (remove parse-option-keys (keys opts))]
@@ -247,7 +246,7 @@
    :skip-text-to-html? :skip-image-links? :skip-text-links?
    :max-html-length :checksum-algo (:md5 default, :sha1, :sha256)
    :keep-delivery-status?. The whole message and every attachment are held
-   in memory (inventory 6.1). Rejects with :email-cljs/parse-error
+   in memory. Rejects with :email-cljs/parse-error
    {:reason :mailparser :message ..} or :argument-error."
   ([source] (parse-message! source nil))
   ([source opts]
@@ -306,8 +305,7 @@
   "Pure: the text of a parsed attachment's :content. The charset comes
    from the part's Content-Type (or `encoding`, a Node encoding name) when
    Node decodes it natively; anything else falls back to UTF-8 (mailparser
-   converts TEXT BODIES to UTF-8 but leaves attachment bytes as sent —
-   inventory 7.1 / 6.5)."
+   converts TEXT BODIES to UTF-8 but leaves attachment bytes as sent)."
   ([a] (attachment->string a nil))
   ([a encoding]
    (some-> (:content a) (att/->string (or encoding (node-encoding (attachment-charset a)) "utf8")))))
@@ -340,7 +338,7 @@
   (or (blank->nil (:text parsed)) (blank->nil (:html parsed))))
 
 ;; ---------------------------------------------------------------------------
-;; build — RFC 822 bytes without a transport (inventory 11.2)
+;; build — RFC 822 bytes without a transport
 ;; ---------------------------------------------------------------------------
 
 (def ^:private priority-headers
@@ -374,8 +372,8 @@
   "Builds the RFC 822 bytes of a kebab message map (the shape send! takes)
    with nodemailer's MailComposer and NO transport: promise of {:source
    <Bytes> :message-id \"<..>\" :envelope {:from :to [..]} :size n}. For
-   imap/append! (drafts, Sent copies — SMTP never stores one, inventory
-   12.12), tests, and parse-message! round trips. Options: :policy
+   imap/append! (drafts, Sent copies — SMTP never stores one), tests, and
+   parse-message! round trips. Options: :policy
    {:allow-file-access? :allow-url-access?} (default: both refused, as for
    a client without the flags), :newline :unix|:windows (CRLF default),
    :allow-no-recipients? true for drafts, :keep-bcc? true to WRITE the

@@ -1,7 +1,7 @@
 (ns email-cljs.imap-binding
   "Binding namespace (JavaScript interop lives here): every imapflow call the
-   library makes, wrapped 1:1 with the JS-collection walking the inventory
-   prescribes (14.2): Set -> set of strings, Map -> map, BigInt -> decimal
+   library makes, wrapped 1:1, with one rule for walking JS collections:
+   Set -> set of strings, Map -> map, BigInt -> decimal
    string, Buffer -> Bytes, Date -> ISO-8601 UTC string, plain objects ->
    kebab-keyword maps (parameter maps and header maps keep their wire keys),
    arrays -> vectors. Inputs go the other way through ->js (Secrets
@@ -114,7 +114,7 @@
     (when-not (undefined? v) v)))
 
 (defn error->map
-  "Reads ImapFlowError / AuthenticationFailure fields (inventory 4.6) into a
+  "Reads ImapFlowError / AuthenticationFailure fields into a
    kebab map: {:message :name :code :command :path :response-status
    :response-text :server-response-code :authentication-failed?
    :tls-failed? :throttle-reset-ms :mailbox-missing? :reason
@@ -154,9 +154,8 @@
    / info entries and hands the `err` of warn / error / fatal entries
    (read through error->map — response status and text, never the raw
    entry, which could carry command lines) to `f` as a map tagged
-   {:level :warn|:error}. imapflow logs a NO / BAD it swallows (SEARCH,
-   inventory 18.2) at warn level, so this is how email-cljs.imap learns
-   the server's words."
+   {:level :warn|:error}. imapflow logs a NO / BAD it swallows (SEARCH) at
+   warn level, so this is how email-cljs.imap learns the server's words."
   [f]
   (let [noop (fn [& _] nil)
         capture (fn [level]
@@ -177,8 +176,8 @@
 (defn make-client
   "new ImapFlow(options): `options` is the string-keyed camelCase map built
    by email-cljs.imap (auth Secrets still wrapped). An 'error' listener is
-   attached immediately (an unhandled 'error' would crash Node, inventory
-   12.9); it calls `on-error` (fn [error-map]) when given. Unless the
+   attached immediately (an unhandled 'error' would crash Node); it calls
+   `on-error` (fn [error-map]) when given. Unless the
    options ask for imapflow's own console logger (\"logger\" true), a
    capturing logger is installed that forwards warn / error entries to the
    same `on-error` tagged with :level (see capture-logger)."
@@ -280,8 +279,8 @@
   (p/then (as-promise (js-invoke conn "status" path (->js query))) js->data))
 
 (defn get-quota
-  "client.getQuota(path) -> quota map (storage already in bytes, inventory
-   13.12) or nil when unsupported."
+  "client.getQuota(path) -> quota map (storage already in bytes) or nil
+   when unsupported."
   [conn path]
   (p/then (as-promise (if path (js-invoke conn "getQuota" path) (js-invoke conn "getQuota")))
           (fn [r] (when (and r (not (false? r))) (js->data r)))))
@@ -293,7 +292,7 @@
 
 (defn mailbox-close
   "client.mailboxClose() — sends CLOSE (expunges \\Deleted in a read-write
-   mailbox, inventory 12.7). Promise of boolean."
+   mailbox). Promise of boolean."
   [conn]
   (p/then (as-promise (js-invoke conn "mailboxClose")) boolean))
 

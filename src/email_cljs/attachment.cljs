@@ -2,12 +2,12 @@
   "The opaque Bytes wrapper: the library's carrier for binary content
    (attachment content going out, message source / downloaded parts coming
    in). A Bytes holds ONE Node Buffer (never copied into a base64 string
-   eagerly — inventory 9.3) and offers lazy views: ->base64 (the
+   eagerly) and offers lazy views: ->base64 (the
    serialisable form), ->string (charset-decoded text), ->ints, size.
    Prints as #email-cljs/bytes {:size N}; equal when the bytes are equal.
 
    Only email-cljs.parse-binding touches the Buffer; this namespace is
-   interop-free. read-file! / write-file! (Phase 4) move Bytes to and from
+   interop-free. read-file! / write-file! move Bytes to and from
    the file system through the same binding; the parsed-attachment helpers
    (attachment->base64, attachment->string, attachment-of ...) live in
    email-cljs.message next to parse-message!."
@@ -72,7 +72,7 @@
 
 (defn ->string
   "The bytes decoded as text (\"utf8\" default; see from-string for the
-   encodings Node decodes natively — iconv charsets arrive with Phase 4)."
+   encodings Node decodes natively)."
   ([b] (->string b "utf8"))
   ([b encoding] (pb/buffer->string (unwrap b) encoding)))
 

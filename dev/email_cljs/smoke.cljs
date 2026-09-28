@@ -34,6 +34,7 @@
             [email-cljs.attachment :as att]
             [email-cljs.imap :as imap]
             [email-cljs.message :as msg]
+            [email-cljs.parse-binding :as pb]
             [email-cljs.smtp :as smtp]
             [email-cljs.util :as util]
             [promesa.core :as p]))
@@ -43,6 +44,10 @@
 ;; ---------------------------------------------------------------------------
 
 (def env-prefix "BORRET_EMAIL_")
+(def secrets-file
+  "The library reads no secrets file unless one is named: the smoke names
+   its own (EMAIL_SECRETS_FILE wins when set)."
+  (or (get (pb/env-map) "EMAIL_SECRETS_FILE") "~/.secrets/borret.txt"))
 (def domain "borret.ro")
 (def smoke-mailbox "email-cljs-smoke")
 
@@ -439,7 +444,7 @@
     (empty? failed)))
 
 (defn main [& _]
-  (let [env (util/from-env env-prefix)
+  (let [env (util/from-env secrets-file env-prefix)
         user (some-> (:username env) util/reveal)
         pass (some-> (:password env) util/reveal)]
     (when (or (nil? user) (nil? pass))
@@ -448,8 +453,8 @@
     (reset! scrubber (fn [s] (-> s (str/replace user "<redacted>") (str/replace pass "<redacted>")
                                  (str/replace (js/encodeURIComponent user) "<redacted>"))))
     (let [stamp (str (.now js/Date))
-          smtp (smtp/smtp-client-from-env env-prefix)
-          imap (imap/imap-client-from-env env-prefix)]
+          smtp (smtp/smtp-client-from-env env-prefix {:secrets-file secrets-file})
+          imap (imap/imap-client-from-env env-prefix {:secrets-file secrets-file})]
       (swap! shared assoc :stamp stamp :smtp smtp :imap imap
              :from user :to (str "smoke-test-" stamp "@" domain))
       (say "email-cljs LIVE smoke —" (now-iso) "— stamp" stamp "— 3 sends to" (:to @shared))

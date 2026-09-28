@@ -14,12 +14,16 @@
 # run only) fetches the toolchain plus nodemailer/imapflow/mailparser; SMTP and
 # IMAP transports are stubbed (nodemailer's jsonTransport / streamTransport and
 # fake imapflow objects), message parsing runs in-process.
+#
+# The publicity gate runs FIRST: src/ and README.md are public documentation.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 if [ ! -d node_modules ]; then
   npm install
 fi
+
+bash test/publicity_gate.sh
 
 npx shadow-cljs compile node-test --config-merge '{:autorun false}'
 exec node target/node-test.js

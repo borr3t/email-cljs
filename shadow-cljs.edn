@@ -4,9 +4,9 @@
 ;; standalone shadow-cljs CLI via the :dependencies key below; deps.edn mirrors
 ;; the same dependencies for consumers using :local/root / git deps.
 ;; core.async ships with shadow-cljs itself (used by email-cljs.imap for the
-;; IDLE event channel, Phase 3).
+;; IDLE event channel).
 ;; The `nodemailer` / `imapflow` / `mailparser` npm packages are required at
-;; runtime by the binding namespaces only (Phase 2+); shadow's :node-* targets
+;; runtime by the binding namespaces only; shadow's :node-* targets
 ;; leave npm requires external. `source-map-support` is picked up automatically
 ;; by the generated node scripts when present (readable stack traces).
 {:source-paths ["src" "test" "dev"]
@@ -29,9 +29,17 @@
         :output-to "target/dev.js"
         :devtools {:enabled true}}
 
-  ;; Phase 5 LIVE smoke: real SMTP sends to the catch-all + IMAP fetch-back,
-  ;; flags, search, watch! (docs/email-api-inventory.org section 15). Needs
-  ;; BORRET_EMAIL_* (environment or ~/.secrets/borret.txt). Not part of run-tests.sh.
+  ;; The examples of the README (dev/email_cljs/examples.cljs), OFFLINE:
+  ;; messages built and parsed in process, a fake transport, a fake mailbox:
+  ;;   npx shadow-cljs compile examples && node target/examples.js
+  :examples {:target :node-script
+             :main email-cljs.examples/main
+             :output-to "target/examples.js"}
+
+  ;; LIVE smoke: real SMTP sends + IMAP fetch-back, flags, search, watch!
+  ;; against a mail account of the person who runs it (credentials from the
+  ;; environment or the secrets file the smoke names). Not part of
+  ;; run-tests.sh.
   ;;   npx shadow-cljs compile smoke && node target/smoke.js
   :smoke {:target :node-script
           :main email-cljs.smoke/main

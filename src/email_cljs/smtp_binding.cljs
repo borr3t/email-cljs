@@ -5,7 +5,7 @@
    wrapped), turns it into JS objects at the last moment, and returns
    promesa promises of kebab-case CLJS maps. Secrets are revealed only
    inside ->js, immediately before nodemailer sees them; they never travel
-   in results or errors (inventory 8.1, 12.11).
+   in results or errors.
 
    Transport objects are opaque to callers: they live under :transport in
    the client map email-cljs.smtp/smtp-client builds and are only ever
@@ -45,7 +45,7 @@
     (when-not (undefined? v) v)))
 
 (defn error->map
-  "Reads the NodemailerError fields (inventory 8.1) off a thrown value into
+  "Reads the NodemailerError fields off a thrown value into
    a kebab map: {:message :name :code :command :response :response-code
    :recipient :rejected :accepted :rejected-errors [..maps..] :cause-message}.
    An ex-info passes through unchanged (already classified). Non-Error
@@ -114,8 +114,8 @@
 
 (defn send-mail
   "transporter.sendMail with a string-keyed camelCase message map (Bytes /
-   Secrets still wrapped). Promise of the kebab send-result map (inventory
-   2.5 / 14.3): {:message-id :envelope {:from :to} :accepted :rejected
+   Secrets still wrapped). Promise of the kebab send-result map:
+   {:message-id :envelope {:from :to} :accepted :rejected
    :rejected-errors :pending :response :ehlo :envelope-time-ms
    :message-time-ms :message-size (:message)}. Rejects with the raw
    NodemailerError (classified by the caller through error->map)."

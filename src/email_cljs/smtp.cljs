@@ -6,8 +6,8 @@
    (verify-smtp! client) checks DNS + TCP + TLS + AUTH; (close-smtp! client)
    closes a pooled transport. Every async operation returns a promesa
    promise; every failure is an ex-info from email-cljs.util (:auth-error,
-   :network-error, :smtp-error, :argument-error, :config-error — inventory
-   8.1) that never carries the password.
+   :network-error, :smtp-error, :argument-error, :config-error) that never
+   carries the password.
 
    All nodemailer interop is in email-cljs.smtp-binding; this namespace
    only translates data: kebab message -> wire camelCase map
@@ -16,15 +16,15 @@
    (error-map->ex). Those three are pure and unit-tested without a
    transport.
 
-   House positions (inventory 13.9, 13.20, 12.15, 11.4): single-connection
-   transport by default, :pool? opt-in; send! resolves even when SOME
+   What the library decides: single-connection transport by default,
+   :pool? opt-in; send! resolves even when SOME
    recipients were rejected (the accepted ones were delivered and cannot be
    recalled) and reports them under :rejected / :all-accepted? — :strict?
    true turns that into an :email-cljs/smtp-error rejection; send! never
    waits for IMAP visibility; Bcc: is stripped from the transmitted message
-   by nodemailer's SMTP transport (docs claim; the Phase 5 smoke asserts
-   it); file (:path) and URL (:href) content sources are refused unless the
-   client was created with :allow-file-access? / :allow-url-access? true."
+   by nodemailer's SMTP transport; file (:path) and URL (:href) content
+   sources are refused unless the client was created with
+   :allow-file-access? / :allow-url-access? true."
   (:require [clojure.string :as str]
             [email-cljs.attachment :as att]
             [email-cljs.smtp-binding :as sb]
@@ -37,7 +37,7 @@
 
 (def default-port
   "Port used when neither :port nor :secure is given: 465, implicit TLS
-   (RFC 8314; the house account — inventory 3.3). 587 + STARTTLS needs an
+   (RFC 8314). 587 + STARTTLS needs an
    explicit {:port 587 :secure false}."
   465)
 
@@ -54,7 +54,7 @@
    a PEM string, Bytes or a vector of those (revealed/unwrapped in the
    binding). rejectUnauthorized is never defaulted to false here: it is
    whatever the caller wrote, and the documented way to trust a private
-   chain is :ca (inventory 13.5)."
+   chain is :ca."
   [tls]
   (when (map? tls)
     (into {} (map (fn [[k v]] [(util/kebab->camel k) v])) tls)))
@@ -150,7 +150,7 @@
    :defaults {message defaults merged into every send}
    :transport <opaque plugin> (tests / jsonTransport: replaces host+port).
    Never sets tls.rejectUnauthorized to false itself; a private chain is
-   trusted through :ca (inventory 13.5). Throws :email-cljs/config-error."
+   trusted through :ca. Throws :email-cljs/config-error."
   [opts]
   (let [opts (or opts {})
         plugin (:transport opts)
@@ -187,9 +187,9 @@
 (defn smtp-client-from-env
   "smtp-client configured from <prefix>USERNAME / PASSWORD / SMTP_HOST /
    SMTP_PORT / SMTP_TLS / TLS_CA read by util/from-env (environment over the
-   secrets file — :secrets-file in `opts` names it, else EMAIL_SECRETS_FILE,
-   else ~/.secrets/borret.txt). `prefix` e.g. \"BORRET_EMAIL_\"; `opts` are
-   merged over the environment values (deep). Throws
+   secrets file — :secrets-file in `opts` names it, else EMAIL_SECRETS_FILE;
+   no file is read unless one is named). `prefix` e.g. \"WORK_EMAIL_\";
+   `opts` are merged over the environment values (deep). Throws
    :email-cljs/config-error when credentials or host are missing."
   ([prefix] (smtp-client-from-env prefix nil))
   ([prefix opts]
@@ -201,7 +201,7 @@
 ;; ---------------------------------------------------------------------------
 
 (def message-keys
-  "Every key a message map may carry (inventory 2.4 / 11.1)."
+  "Every key a message map may carry."
   #{:from :sender :reply-to :to :cc :bcc
     :subject :text :html :watch-html :amp :ical-event
     :attachments :alternatives :headers :list :envelope
@@ -229,7 +229,7 @@
 (defn- content-source->wire
   "Attachment / alternative map -> wire map (kebab keys kept; camelised by
    the caller). Validates the single content source and the file/URL
-   policy (inventory 9.2, 11.4)."
+   policy."
   [policy what idx a]
   (when-not (map? a)
     (throw (util/argument-error (str what " " idx " must be a map") {:reason :bad-attachment :index idx})))
@@ -312,7 +312,7 @@
        (util/->camel-keys m)))))
 
 ;; ---------------------------------------------------------------------------
-;; Error classification (pure; inventory 8.1)
+;; Error classification (pure)
 ;; ---------------------------------------------------------------------------
 
 (def ^:private network-codes #{"ECONNECTION" "ETIMEDOUT" "ESOCKET" "EDNS" "ETLS" "EPROTOCOL"})
@@ -323,7 +323,7 @@
 (defn error-map->ex
   "Pure: a NodemailerError read into a map by smtp-binding/error->map
    ({:code :command :response :response-code :message :rejected :accepted
-   :rejected-errors :recipient}) -> the house ex-info:
+   :rejected-errors :recipient}) -> the library's ex-info:
    EAUTH / EOAUTH2 -> :auth-error (454 retryable); ENOAUTH -> :config-error
    :missing-credentials; ECONNECTION ETIMEDOUT ESOCKET -> :network-error
    retryable; EDNS -> :network-error; ETLS -> :network-error :tls? true;
@@ -392,7 +392,7 @@
   "nodemailer verify(): resolves DNS, connects, negotiates TLS and
    authenticates, then QUITs. Promise of true; rejects with :auth-error /
    :network-error / :config-error. Does NOT check that a sender address is
-   accepted (inventory 2.1)."
+   accepted."
   [client]
   (-> (start #(sb/verify (:transport client)))
       (p/catch (fn [e] (p/rejected (->ex e))))))
@@ -412,8 +412,8 @@
 
    Partial rejection: when the server refused some recipients at RCPT TO
    but accepted others, the message WAS delivered to the accepted ones and
-   the promise resolves with them under :rejected (:all-accepted? false)
-   — inventory 12.15. With {:strict? true} that case rejects with
+   the promise resolves with them under :rejected (:all-accepted? false).
+   With {:strict? true} that case rejects with
    :email-cljs/smtp-error {:reason :partial-rejection :rejected :accepted}
    instead (after delivery; nothing can be recalled). All recipients
    rejected always rejects (:smtp-error, code EENVELOPE). Never waits for
